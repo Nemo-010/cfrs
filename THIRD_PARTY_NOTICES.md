@@ -19,8 +19,18 @@ the wire behaviour of, the following work.
   the edge's TLS certificate chains to, both vendored transitively by
   `cloudflare-quick-tunnel`.
 
+## quickbridge
+
+- Source: https://github.com/cfaulkingham/quickbridge
+- License: MIT
+- Used for: the session model that `cfrs share` reimplements — a PIN-gated
+  upload/download/proxy session with a token path, transfer limits, stop-after
+  and idle timeout. No code is copied; the behaviour is reimplemented on axum.
+
 ## Rust dependencies
 
-`clap`, `tokio`, `quinn`, `rustls`, `httparse`, `reqwest`, `tracing`,
-`tracing-subscriber`, `uuid`, `anyhow` and their transitive dependencies each
-carry their own permissive licenses; `cargo metadata` lists them exhaustively.
+`clap`, `tokio`, `quinn`, `rustls`, `httparse`, `reqwest`, `axum`, `tower`,
+`tower-http`, `http-body-util`, `futures`, `tokio-util`, `serde`, `serde_json`,
+`serde_yaml`, `base64`, `qrcode`, `webpki-roots`, `tracing`, `tracing-subscriber`,
+`uuid`, `anyhow` and their transitive dependencies each carry their own
+permissive licenses; `cargo metadata` lists them exhaustively.

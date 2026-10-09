@@ -1,14 +1,18 @@
 [package]
 name = "cfrs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.86"
 license = "0BSD"
-description = "Expose a local unix-socket or TCP HTTP server on the public Electrosphere through an anonymous Cloudflare quick tunnel, from a single Rust binary."
+description = "Library and CLI that expose anything (HTTP, HTTPS, WebSocket, TCP, unix sockets, directories, files) on the public Electrosphere through Cloudflare tunnels, quick or named."
 repository = "https://github.com/Nemo-010/cfrs"
 readme = "README.md"
-keywords = ["cloudflare", "tunnel", "trycloudflare", "quic", "unix-socket"]
+keywords = ["cloudflare", "tunnel", "trycloudflare", "quic", "reverse-proxy"]
 categories = ["network-programming", "command-line-utilities"]
+
+[lib]
+name = "cfrs"
+path = "src/lib.rs"
 
 [[bin]]
 name = "cfrs"
@@ -16,12 +20,19 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-clap = { version = "4.5", features = ["derive"] }
+axum = { version = "0.8", features = ["multipart"] }
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive", "env"] }
 cloudflare-quick-tunnel = "=0.3.1"
 futures = "0.3"
 httparse = "1"
+http-body-util = "0.1"
+qrcode = { version = "0.14", default-features = false }
 quinn = "0.11"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
 tokio = { version = "1", features = [
     "macros",
     "rt-multi-thread",
@@ -31,10 +42,23 @@ tokio = { version = "1", features = [
     "sync",
     "signal",
     "fs",
+    "process",
 ] }
+tokio-util = { version = "0.7", features = ["compat", "io"] }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "tls12",
+    "logging",
+] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+webpki-roots = "0.26"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 lto = "thin"

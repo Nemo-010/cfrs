@@ -1,120 +1,555 @@
-//! Proxy one inbound tunnel stream to the local origin.
+//! Inbound tunnel streams: parse the edge framing and dispatch to a service.
 //!
-//! The edge opens a bidi QUIC stream per request and frames it as
-//! `[6-byte signature][2-byte version][capnp ConnectRequest]`. We answer with
-//! the matching `ConnectResponse` (status + headers in its metadata) and then
-//! the stream carries the body. This is the same framing `cloudflared` uses;
-//! the `cloudflare-quick-tunnel` crate supplies the codec and we supply the
-//! unix-socket dial.
-//!
-//! Plain requests (bounded `Content-Length`, no Upgrade) take a sequential
-//! path: forward exactly the request body, read the response head, forward it,
-//! then forward exactly the response body. Chunked requests and WebSocket
-//! upgrades take a bidirectional pump instead.
+//! One QUIC stream carries one request. After the `ConnectRequest` preamble the
+//! stream is either HTTP (we synthesise an HTTP/1.1 request for the origin and
+//! relay the response) or raw TCP (byte pump). Built-in services are axum
+//! routers called directly, so multipart, directory serving and file transfer
+//! work without an external process.
 
-use std::time::Duration;
-
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use axum::body::Body;
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Request, Response};
 use cloudflare_quick_tunnel::stream as cqstream;
 use cloudflare_quick_tunnel::stream::{HTTP_HEADER_KEY, HTTP_HOST_KEY, HTTP_METHOD_KEY};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt};
+use tower::ServiceExt;
 
-use crate::origin::{Origin, OriginStream};
+use crate::gate::UNLOCK_PATH;
+use crate::ingress::{Ingress, OriginOptions, Service};
+use crate::metrics::Metrics;
+use crate::net::{self, BoxedIo};
+use crate::service::{Built, ServiceRuntime};
+use crate::share::ShareControl;
+use crate::util::path_and_query;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_HEAD_BYTES: usize = 32 * 1024;
 
-pub async fn serve_stream(origin: Origin, send: quinn::SendStream, recv: quinn::RecvStream) {
-    if let Err(err) = serve_inner(origin, send, recv).await {
-        tracing::warn!(error = %err, "stream proxy failed");
+type EdgeReader = Compat<quinn::RecvStream>;
+type EdgeWriter = Compat<quinn::SendStream>;
+
+/// Handle one inbound stream. Errors are logged, never propagated to the edge.
+pub async fn serve_stream(
+    runtime: std::sync::Arc<ServiceRuntime>,
+    ingress: std::sync::Arc<Ingress>,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+) {
+    let metrics = runtime.metrics().clone();
+    metrics.stream_started();
+    if let Err(err) = serve_inner(&runtime, &ingress, send, recv).await {
+        metrics.error();
+        tracing::warn!(error = %err, "stream failed");
     }
+    metrics.stream_finished();
 }
 
 async fn serve_inner(
-    origin: Origin,
+    runtime: &ServiceRuntime,
+    ingress: &Ingress,
     send: quinn::SendStream,
     recv: quinn::RecvStream,
 ) -> Result<()> {
-    let (mut edge_r, mut edge_w) = cqstream::split(send, recv);
-    let request = cqstream::read_connect_request(&mut edge_r).await?;
-    tracing::debug!(dest = %request.dest, kind = ?request.conn_type, "inbound stream");
+    let (mut reader, writer) = cqstream::split(send, recv);
+    let request = cqstream::read_connect_request(&mut reader).await?;
+    let host = request
+        .meta(HTTP_HOST_KEY)
+        .map(str::to_string)
+        .or_else(|| crate::util::authority_of(&request.dest))
+        .unwrap_or_default();
+    let path = path_and_query(&request.dest);
+    tracing::debug!(%host, %path, kind = ?request.conn_type, "inbound");
 
-    let mut origin_stream = tokio::time::timeout(CONNECT_TIMEOUT, origin.connect())
-        .await
-        .map_err(|_| anyhow!("origin connect timed out"))??;
+    let Some(index) = ingress.resolve_index(&host, &path) else {
+        let mut writer = writer;
+        return write_simple_response(
+            &mut writer,
+            503,
+            "text/plain; charset=utf-8",
+            b"cfrs: no ingress rule matched\n",
+        )
+        .await;
+    };
+    let built = runtime.get(index).context("runtime rule missing")?;
 
-    let upgrade = is_upgrade(&request);
-    let head = build_request_head(&request, upgrade);
-    origin_stream.write_all(head.as_bytes()).await?;
+    match built {
+        Built::Forward(service, options) => {
+            forward_http(service, options, &request, reader, writer, runtime.metrics()).await
+        }
+        Built::Tcp(service, options) => {
+            forward_tcp(service, options, &request, reader, writer, runtime.metrics()).await
+        }
+        Built::HelloWorld => {
+            let mut writer = writer;
+            write_simple_response(
+                &mut writer,
+                200,
+                "text/plain; charset=utf-8",
+                b"Hello, world! (cfrs)\n",
+            )
+            .await
+        }
+        Built::Status(code) => {
+            let mut writer = writer;
+            write_simple_response(&mut writer, *code, "text/plain; charset=utf-8", b"").await
+        }
+        Built::Metrics => {
+            let text = runtime.metrics().prometheus();
+            let mut writer = writer;
+            write_simple_response(
+                &mut writer,
+                200,
+                "text/plain; version=0.0.4; charset=utf-8",
+                text.as_bytes(),
+            )
+            .await
+        }
+        Built::Static(router) => {
+            dispatch_axum(router.clone(), &request, &host, reader, writer, runtime.metrics()).await
+        }
+        Built::Share(app) => {
+            dispatch_axum(app.router(), &request, &host, reader, writer, runtime.metrics()).await
+        }
+        Built::ShareProxy {
+            target,
+            gate,
+            control,
+        } => {
+            share_proxy(
+                target,
+                gate,
+                control,
+                &request,
+                &host,
+                reader,
+                writer,
+                runtime.metrics(),
+            )
+            .await
+        }
+    }
+}
 
-    if upgrade || is_chunked(&request) {
-        return proxy_bidi(&mut edge_r, &mut edge_w, origin_stream).await;
+// ── HTTP forwarding ─────────────────────────────────────────────────────────
+
+async fn forward_http(
+    service: &Service,
+    options: &OriginOptions,
+    request: &cqstream::ConnectRequest,
+    mut reader: EdgeReader,
+    mut writer: EdgeWriter,
+    metrics: &Metrics,
+) -> Result<()> {
+    let mut io = net::dial(service, options).await?;
+    let upgrade = is_upgrade(request);
+    let head = build_request_head(request, options, upgrade);
+    tokio::io::AsyncWriteExt::write_all(&mut io, head.as_bytes()).await?;
+
+    if upgrade || is_chunked(request) {
+        return proxy_bidi(&mut reader, &mut writer, io, metrics).await;
     }
 
-    // Bounded request body: forward exactly Content-Length bytes (or none).
-    if let Some(len) = header_value(&request, "content-length").and_then(|v| v.parse::<u64>().ok())
-    {
+    if let Some(len) = content_length(request) {
         if len > 0 {
-            copy_futures_to_tokio_n(&mut edge_r, &mut origin_stream, len).await?;
+            copy_futures_to_tokio_n(&mut reader, &mut io, len, metrics).await?;
         }
     }
 
-    let (status, headers, leftover) = read_response_head(&mut origin_stream).await?;
-    write_response_meta(&mut edge_w, status, &headers).await?;
+    let (status, headers, leftover) = read_response_head(&mut io).await?;
+    write_response_meta(&mut writer, status, &headers).await?;
     if !leftover.is_empty() {
-        futures_write_all(&mut edge_w, &leftover).await?;
+        futures_write_all(&mut writer, &leftover).await?;
+        metrics.add_out(leftover.len() as u64);
     }
-
     let resp_len = headers_value(&headers, "content-length").and_then(|v| v.parse::<u64>().ok());
     match resp_len {
         Some(total) => {
             let remaining = total.saturating_sub(leftover.len() as u64);
             if remaining > 0 {
-                copy_tokio_to_futures_n(&mut origin_stream, &mut edge_w, remaining).await?;
+                copy_tokio_to_futures_n(&mut io, &mut writer, remaining, metrics).await?;
             }
         }
         None => {
-            // We asked the origin to close, so EOF marks the body end.
-            copy_tokio_to_futures_eof(&mut origin_stream, &mut edge_w).await?;
+            copy_tokio_to_futures_eof(&mut io, &mut writer, metrics).await?;
         }
     }
-    futures_close(&mut edge_w).await?;
-    Ok(())
+    futures_close(&mut writer).await
 }
 
-async fn proxy_bidi<R, W>(edge_r: &mut R, edge_w: &mut W, origin_stream: OriginStream) -> Result<()>
-where
-    R: futures::io::AsyncRead + Unpin,
-    W: futures::io::AsyncWrite + Unpin,
-{
-    let (mut origin_r, mut origin_w) = tokio::io::split(origin_stream);
+async fn proxy_bidi(
+    reader: &mut EdgeReader,
+    writer: &mut EdgeWriter,
+    io: BoxedIo,
+    metrics: &Metrics,
+) -> Result<()> {
+    let (mut io_r, mut io_w) = tokio::io::split(io);
+    let in_metrics = metrics.clone();
+    let out_metrics = metrics.clone();
 
     let request_pump = async {
-        let _ = copy_futures_to_tokio_eof(edge_r, &mut origin_w).await;
-        let _ = origin_w.shutdown().await;
+        let _ = copy_futures_to_tokio_eof(reader, &mut io_w, &in_metrics).await;
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut io_w).await;
     };
     let response_pump = async {
-        let (status, headers, leftover) = read_response_head(&mut origin_r).await?;
-        write_response_meta(edge_w, status, &headers).await?;
+        let (status, headers, leftover) = read_response_head(&mut io_r).await?;
+        write_response_meta(writer, status, &headers).await?;
         if !leftover.is_empty() {
-            futures_write_all(edge_w, &leftover).await?;
+            futures_write_all(writer, &leftover).await?;
+            out_metrics.add_out(leftover.len() as u64);
         }
-        copy_tokio_to_futures_eof(&mut origin_r, edge_w).await?;
-        futures_close(edge_w).await?;
+        copy_tokio_to_futures_eof(&mut io_r, writer, &out_metrics).await?;
+        futures_close(writer).await?;
         Ok::<(), anyhow::Error>(())
     };
-
     let (_, response) = tokio::join!(request_pump, response_pump);
     response
 }
 
+async fn forward_tcp(
+    service: &Service,
+    options: &OriginOptions,
+    _request: &cqstream::ConnectRequest,
+    mut reader: EdgeReader,
+    mut writer: EdgeWriter,
+    metrics: &Metrics,
+) -> Result<()> {
+    let io = net::dial(service, options).await?;
+    cqstream::write_connect_response(&mut writer, "", &[]).await?;
+    let (mut io_r, mut io_w) = tokio::io::split(io);
+    let in_metrics = metrics.clone();
+    let out_metrics = metrics.clone();
+    let to_origin = async {
+        let _ = copy_futures_to_tokio_eof(&mut reader, &mut io_w, &in_metrics).await;
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut io_w).await;
+    };
+    let from_origin = async {
+        let _ = copy_tokio_to_futures_eof(&mut io_r, &mut writer, &out_metrics).await;
+        let _ = futures_close(&mut writer).await;
+    };
+    tokio::join!(to_origin, from_origin);
+    Ok(())
+}
+
+// ── Built-in (axum) dispatch ────────────────────────────────────────────────
+
+async fn dispatch_axum(
+    router: axum::Router,
+    request: &cqstream::ConnectRequest,
+    host: &str,
+    reader: EdgeReader,
+    mut writer: EdgeWriter,
+    metrics: &Metrics,
+) -> Result<()> {
+    let uri = path_and_query(&request.dest);
+    let method = request.meta(HTTP_METHOD_KEY).unwrap_or("GET");
+    let builder = Request::builder().method(method).uri(uri);
+
+    let mut headers = HeaderMap::new();
+    for (key, value) in &request.metadata {
+        let Some(name) = key.strip_prefix(&format!("{HTTP_HEADER_KEY}:")) else {
+            continue;
+        };
+        if is_hop_by_hop(name) {
+            continue;
+        }
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            headers.append(name, value);
+        }
+    }
+    if !headers.contains_key(axum::http::header::HOST) && !host.is_empty() {
+        if let Ok(value) = HeaderValue::from_str(host) {
+            headers.insert(axum::http::header::HOST, value);
+        }
+    }
+
+    let body = Body::from_stream(tokio_util::io::ReaderStream::new(reader.compat()));
+    let mut axum_request = builder.body(body)?;
+    *axum_request.headers_mut() = headers;
+
+    let response: Response<Body> = router
+        .oneshot(axum_request)
+        .await
+        .map_err(|e| anyhow!("service error: {e}"))?;
+
+    write_axum_response(&mut writer, response, metrics).await
+}
+
+async fn write_axum_response(
+    writer: &mut EdgeWriter,
+    response: Response<Body>,
+    metrics: &Metrics,
+) -> Result<()> {
+    let status = response.status().as_u16();
+    let mut headers: Vec<(String, String)> = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                value.to_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+
+    let has_len = headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("content-length"));
+    let has_chunked = headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("transfer-encoding")
+            && value.to_ascii_lowercase().contains("chunked")
+    });
+
+    let body = response.into_body();
+    if !has_len && !has_chunked {
+        // Small built-in bodies: buffer so the edge gets a Content-Length.
+        let bytes = http_body_util::BodyExt::collect(body)
+            .await
+            .map_err(|e| anyhow!("reading response body: {e}"))?
+            .to_bytes();
+        headers.push(("Content-Length".to_string(), bytes.len().to_string()));
+        write_response_meta(writer, status, &headers).await?;
+        futures_write_all(writer, &bytes).await?;
+        metrics.add_out(bytes.len() as u64);
+    } else {
+        write_response_meta(writer, status, &headers).await?;
+        use futures::StreamExt;
+        let mut stream = body.into_data_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| anyhow!("response body: {e}"))?;
+            futures_write_all(writer, &chunk).await?;
+            metrics.add_out(chunk.len() as u64);
+        }
+    }
+    futures_close(writer).await
+}
+
+// ── quickbridge proxy mode ──────────────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+async fn share_proxy(
+    target: &str,
+    gate: &crate::gate::Gate,
+    control: &ShareControl,
+    request: &cqstream::ConnectRequest,
+    _host: &str,
+    mut reader: EdgeReader,
+    mut writer: EdgeWriter,
+    metrics: &Metrics,
+) -> Result<()> {
+    let path = path_and_query(&request.dest);
+    let method = request.meta(HTTP_METHOD_KEY).unwrap_or("GET");
+    let headers = headers_from_request(request);
+
+    if path == UNLOCK_PATH && method.eq_ignore_ascii_case("POST") {
+        let body = read_body(&mut reader, content_length(request).unwrap_or(0)).await?;
+        let fields = parse_form(&body);
+        let password = fields
+            .iter()
+            .find(|(k, _)| k == "password")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        let next = fields
+            .iter()
+            .find(|(k, _)| k == "next")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| "/".to_string());
+        return match gate.unlock(&password) {
+            Some(cookie) => {
+                write_simple_response_with(
+                    &mut writer,
+                    303,
+                    "text/plain; charset=utf-8",
+                    b"",
+                    &[
+                        ("Location".to_string(), sanitize_next(&next)),
+                        ("Set-Cookie".to_string(), cookie),
+                    ],
+                )
+                .await
+            }
+            None => {
+                let html = gate.page_html(&next, true);
+                write_simple_response(
+                    &mut writer,
+                    200,
+                    "text/html; charset=utf-8",
+                    html.as_bytes(),
+                )
+                .await
+            }
+        };
+    }
+
+    if !gate.is_open(&headers) {
+        let html = gate.page_html(&path, false);
+        return write_simple_response(
+            &mut writer,
+            200,
+            "text/html; charset=utf-8",
+            html.as_bytes(),
+        )
+        .await;
+    }
+
+    control.touch();
+    let service = Service::Http(format!("http://{target}"));
+    forward_http(
+        &service,
+        &OriginOptions::default(),
+        request,
+        reader,
+        writer,
+        metrics,
+    )
+    .await
+}
+
+fn sanitize_next(next: &str) -> String {
+    if next.starts_with('/') && !next.starts_with("//") {
+        next.to_string()
+    } else {
+        "/".to_string()
+    }
+}
+
+fn headers_from_request(request: &cqstream::ConnectRequest) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for (key, value) in &request.metadata {
+        let Some(name) = key.strip_prefix(&format!("{HTTP_HEADER_KEY}:")) else {
+            continue;
+        };
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            headers.append(name, value);
+        }
+    }
+    headers
+}
+
+async fn read_body(reader: &mut EdgeReader, len: u64) -> Result<Vec<u8>> {
+    let mut body = vec![0u8; len as usize];
+    if len > 0 {
+        futures::io::AsyncReadExt::read_exact(reader, &mut body).await?;
+    }
+    Ok(body)
+}
+
+fn parse_form(body: &[u8]) -> Vec<(String, String)> {
+    let text = String::from_utf8_lossy(body);
+    text.split('&')
+        .filter_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            Some((percent_decode(key), percent_decode(value)))
+        })
+        .collect()
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or("");
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    out.push(byte);
+                    index += 3;
+                } else {
+                    out.push(bytes[index]);
+                    index += 1;
+                }
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+// ── Response helpers ────────────────────────────────────────────────────────
+
+async fn write_simple_response(
+    writer: &mut EdgeWriter,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) -> Result<()> {
+    write_simple_response_with(writer, status, content_type, body, &[]).await
+}
+
+async fn write_simple_response_with(
+    writer: &mut EdgeWriter,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    extra: &[(String, String)],
+) -> Result<()> {
+    let mut headers = vec![
+        ("Content-Type".to_string(), content_type.to_string()),
+        ("Content-Length".to_string(), body.len().to_string()),
+    ];
+    headers.extend(extra.iter().cloned());
+    write_response_meta(writer, status, &headers).await?;
+    if !body.is_empty() {
+        futures_write_all(writer, body).await?;
+    }
+    futures_close(writer).await
+}
+
+/// Build the `ConnectResponse` metadata pairs. The status is a bare
+/// `HttpStatus`; every header must be `HttpHeader:<Name>` or the edge drops it.
+fn response_meta_pairs(status: u16, headers: &[(String, String)]) -> Vec<(String, String)> {
+    let prefix = format!("{HTTP_HEADER_KEY}:");
+    let mut meta: Vec<(String, String)> = Vec::with_capacity(headers.len() + 1);
+    meta.push((cqstream::HTTP_STATUS_KEY.to_string(), status.to_string()));
+    for (name, value) in headers {
+        let key = if name == cqstream::HTTP_STATUS_KEY || name.starts_with(&prefix) {
+            name.clone()
+        } else {
+            format!("{prefix}{name}")
+        };
+        meta.push((key, value.clone()));
+    }
+    meta
+}
+
+async fn write_response_meta(
+    writer: &mut EdgeWriter,
+    status: u16,
+    headers: &[(String, String)],
+) -> Result<()> {
+    let meta = response_meta_pairs(status, headers);
+    let refs: Vec<(&str, &str)> = meta.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    cqstream::write_connect_response(writer, "", &refs).await?;
+    Ok(())
+}
+
 // ── Request head ────────────────────────────────────────────────────────────
 
-fn build_request_head(req: &cqstream::ConnectRequest, upgrade: bool) -> String {
-    let method = req.meta(HTTP_METHOD_KEY).unwrap_or("GET");
-    let host = req.meta(HTTP_HOST_KEY).unwrap_or("");
-    let path = request_path(&req.dest);
-    let header_prefix = format!("{HTTP_HEADER_KEY}:");
+fn build_request_head(
+    request: &cqstream::ConnectRequest,
+    options: &OriginOptions,
+    upgrade: bool,
+) -> String {
+    let method = request.meta(HTTP_METHOD_KEY).unwrap_or("GET");
+    let path = request_path(&request.dest);
+    let host = options
+        .http_host_header
+        .clone()
+        .or_else(|| request.meta(HTTP_HOST_KEY).map(str::to_string))
+        .unwrap_or_default();
+    let prefix = format!("{HTTP_HEADER_KEY}:");
 
     let mut head = String::with_capacity(256);
     head.push_str(method);
@@ -123,13 +558,12 @@ fn build_request_head(req: &cqstream::ConnectRequest, upgrade: bool) -> String {
     head.push_str(" HTTP/1.1\r\n");
     if !host.is_empty() {
         head.push_str("Host: ");
-        head.push_str(host);
+        head.push_str(&host);
         head.push_str("\r\n");
     }
-
     let mut saw_connection = false;
-    for (key, value) in &req.metadata {
-        let Some(name) = key.strip_prefix(&header_prefix) else {
+    for (key, value) in &request.metadata {
+        let Some(name) = key.strip_prefix(&prefix) else {
             continue;
         };
         if name.eq_ignore_ascii_case("host") {
@@ -155,70 +589,59 @@ fn build_request_head(req: &cqstream::ConnectRequest, upgrade: bool) -> String {
 }
 
 fn request_path(dest: &str) -> String {
-    if let Some(scheme) = dest.find("://") {
-        let rest = &dest[scheme + 3..];
-        return match rest.find('/') {
-            Some(slash) => rest[slash..].to_string(),
-            None => "/".to_string(),
-        };
-    }
-    if dest.starts_with('/') {
-        dest.to_string()
-    } else {
-        "/".to_string()
-    }
+    path_and_query(dest)
 }
 
-fn header_value<'a>(req: &'a cqstream::ConnectRequest, name: &str) -> Option<&'a str> {
+fn header_value<'a>(request: &'a cqstream::ConnectRequest, name: &str) -> Option<&'a str> {
     let prefix = format!("{HTTP_HEADER_KEY}:");
-    req.metadata.iter().find_map(|(key, value)| {
+    request.metadata.iter().find_map(|(key, value)| {
         key.strip_prefix(&prefix)
             .filter(|header| header.eq_ignore_ascii_case(name))
             .map(|_| value.as_str())
     })
 }
 
-fn is_chunked(req: &cqstream::ConnectRequest) -> bool {
-    header_value(req, "transfer-encoding")
+fn content_length(request: &cqstream::ConnectRequest) -> Option<u64> {
+    header_value(request, "content-length").and_then(|v| v.parse().ok())
+}
+
+fn is_chunked(request: &cqstream::ConnectRequest) -> bool {
+    header_value(request, "transfer-encoding")
         .map(|v| v.to_ascii_lowercase().contains("chunked"))
         .unwrap_or(false)
 }
 
-fn is_upgrade(req: &cqstream::ConnectRequest) -> bool {
-    header_value(req, "upgrade").is_some()
-        || header_value(req, "connection")
+fn is_upgrade(request: &cqstream::ConnectRequest) -> bool {
+    header_value(request, "upgrade").is_some()
+        || header_value(request, "connection")
             .map(|v| v.to_ascii_lowercase().contains("upgrade"))
             .unwrap_or(false)
 }
 
-// ── Response head ───────────────────────────────────────────────────────────
-
-async fn write_response_meta<W>(
-    writer: &mut W,
-    status: u16,
-    headers: &[(String, String)],
-) -> Result<()>
-where
-    W: futures::io::AsyncWrite + Unpin,
-{
-    let mut meta: Vec<(String, String)> = Vec::with_capacity(headers.len() + 1);
-    meta.push((cqstream::HTTP_STATUS_KEY.to_string(), status.to_string()));
-    for (name, value) in headers {
-        meta.push((format!("{HTTP_HEADER_KEY}:{name}"), value.clone()));
-    }
-    let refs: Vec<(&str, &str)> = meta.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    cqstream::write_connect_response(writer, "", &refs).await?;
-    Ok(())
+fn is_hop_by_hop(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailers"
+            | "transfer-encoding"
+            | "upgrade"
+    )
 }
 
-async fn read_response_head<R>(origin: &mut R) -> Result<(u16, Vec<(String, String)>, Vec<u8>)>
+// ── Response head ───────────────────────────────────────────────────────────
+
+async fn read_response_head<R>(io: &mut R) -> Result<(u16, Vec<(String, String)>, Vec<u8>)>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     let mut tmp = [0u8; 2048];
     loop {
-        let n = origin.read(&mut tmp).await?;
+        let n = tokio::io::AsyncReadExt::read(io, &mut tmp).await?;
         if n == 0 {
             bail!("origin closed before sending a response head");
         }
@@ -226,7 +649,6 @@ where
         if buf.len() > MAX_HEAD_BYTES {
             bail!("origin response head exceeds {MAX_HEAD_BYTES} bytes");
         }
-
         let parsed = {
             let mut headers = [httparse::EMPTY_HEADER; 64];
             let mut response = httparse::Response::new(&mut headers);
@@ -248,7 +670,6 @@ where
                 httparse::Status::Partial => None,
             }
         };
-
         if let Some((status, pairs, consumed)) = parsed {
             let leftover = buf.split_off(consumed);
             return Ok((status, pairs, leftover));
@@ -264,11 +685,13 @@ fn headers_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a 
 }
 
 // ── Byte pumps ──────────────────────────────────────────────────────────────
-//
-// Written against fully-qualified trait methods so the futures-io and tokio-io
-// extension traits never collide.
 
-async fn copy_futures_to_tokio_n<R, W>(src: &mut R, dst: &mut W, mut remaining: u64) -> Result<()>
+async fn copy_futures_to_tokio_n<R, W>(
+    src: &mut R,
+    dst: &mut W,
+    mut remaining: u64,
+    metrics: &Metrics,
+) -> Result<()>
 where
     R: futures::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
@@ -281,12 +704,17 @@ where
             bail!("edge EOF with {remaining} request bytes still expected");
         }
         tokio::io::AsyncWriteExt::write_all(dst, &buf[..n]).await?;
+        metrics.add_in(n as u64);
         remaining -= n as u64;
     }
     Ok(())
 }
 
-async fn copy_futures_to_tokio_eof<R, W>(src: &mut R, dst: &mut W) -> Result<u64>
+async fn copy_futures_to_tokio_eof<R, W>(
+    src: &mut R,
+    dst: &mut W,
+    metrics: &Metrics,
+) -> Result<u64>
 where
     R: futures::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
@@ -299,12 +727,18 @@ where
             break;
         }
         tokio::io::AsyncWriteExt::write_all(dst, &buf[..n]).await?;
+        metrics.add_in(n as u64);
         total += n as u64;
     }
     Ok(total)
 }
 
-async fn copy_tokio_to_futures_n<R, W>(src: &mut R, dst: &mut W, mut remaining: u64) -> Result<()>
+async fn copy_tokio_to_futures_n<R, W>(
+    src: &mut R,
+    dst: &mut W,
+    mut remaining: u64,
+    metrics: &Metrics,
+) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: futures::io::AsyncWrite + Unpin,
@@ -317,12 +751,17 @@ where
             bail!("origin EOF with {remaining} response bytes still expected");
         }
         futures::io::AsyncWriteExt::write_all(dst, &buf[..n]).await?;
+        metrics.add_out(n as u64);
         remaining -= n as u64;
     }
     Ok(())
 }
 
-async fn copy_tokio_to_futures_eof<R, W>(src: &mut R, dst: &mut W) -> Result<u64>
+async fn copy_tokio_to_futures_eof<R, W>(
+    src: &mut R,
+    dst: &mut W,
+    metrics: &Metrics,
+) -> Result<u64>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: futures::io::AsyncWrite + Unpin,
@@ -335,6 +774,7 @@ where
             break;
         }
         futures::io::AsyncWriteExt::write_all(dst, &buf[..n]).await?;
+        metrics.add_out(n as u64);
         total += n as u64;
     }
     Ok(total)
@@ -373,45 +813,52 @@ mod tests {
     }
 
     #[test]
-    fn path_is_extracted() {
-        assert_eq!(request_path("https://x.trycloudflare.com/a?b=1"), "/a?b=1");
-        assert_eq!(request_path("https://x.trycloudflare.com"), "/");
-        assert_eq!(request_path("/relative"), "/relative");
-    }
-
-    #[test]
-    fn head_has_method_host_and_headers() {
+    fn head_and_flags() {
         let request = req(
             "https://x/a",
             vec![
                 (HTTP_METHOD_KEY, "POST"),
                 (HTTP_HOST_KEY, "x"),
-                ("HttpHeader:X-Test", "1"),
+                ("HttpHeader:Content-Length", "5"),
             ],
         );
-        let head = build_request_head(&request, false);
+        assert_eq!(content_length(&request), Some(5));
+        let head = build_request_head(&request, &OriginOptions::default(), false);
         assert!(head.starts_with("POST /a HTTP/1.1\r\n"));
-        assert!(head.contains("Host: x\r\n"));
-        assert!(head.contains("X-Test: 1\r\n"));
         assert!(head.contains("Connection: close\r\n"));
-        assert!(head.ends_with("\r\n\r\n"));
     }
 
     #[test]
-    fn upgrade_is_detected() {
-        let request = req("https://x/ws", vec![("HttpHeader:Upgrade", "websocket")]);
-        assert!(is_upgrade(&request));
-        let head = build_request_head(&request, true);
-        assert!(head.contains("Upgrade: websocket\r\n"));
-        assert!(head.contains("Connection: Upgrade\r\n"));
-    }
-
-    #[test]
-    fn chunked_is_detected() {
-        let request = req(
-            "https://x/upload",
+    fn upgrade_and_chunked() {
+        let ws = req("https://x/ws", vec![("HttpHeader:Upgrade", "websocket")]);
+        assert!(is_upgrade(&ws));
+        let chunked = req(
+            "https://x/u",
             vec![("HttpHeader:Transfer-Encoding", "chunked")],
         );
-        assert!(is_chunked(&request));
+        assert!(is_chunked(&chunked));
+    }
+
+    #[test]
+    fn form_parsing() {
+        let fields = parse_form(b"password=123456&next=%2Fs%2Fabc%2F&x=a+b");
+        assert!(fields.contains(&("password".to_string(), "123456".to_string())));
+        assert!(fields.contains(&("next".to_string(), "/s/abc/".to_string())));
+        assert!(fields.contains(&("x".to_string(), "a b".to_string())));
+    }
+
+    #[test]
+    fn response_meta_prefixes_headers() {
+        let headers = vec![
+            ("Content-Type".to_string(), "text/plain".to_string()),
+            ("Set-Cookie".to_string(), "a=b".to_string()),
+            ("HttpHeader:Location".to_string(), "/next".to_string()),
+        ];
+        let meta = response_meta_pairs(303, &headers);
+        assert_eq!(meta[0], ("HttpStatus".to_string(), "303".to_string()));
+        assert!(meta.contains(&("HttpHeader:Content-Type".to_string(), "text/plain".to_string())));
+        assert!(meta.contains(&("HttpHeader:Set-Cookie".to_string(), "a=b".to_string())));
+        assert!(meta.contains(&("HttpHeader:Location".to_string(), "/next".to_string())));
+        assert!(!meta.iter().any(|(k, _)| k == "Content-Type"));
     }
 }

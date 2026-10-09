@@ -86,6 +86,13 @@ Proto `ConnectRequest` carrying the destination URL, the connection type
 `ConnectResponse` (status + headers) and then the stream is a byte pipe. The
 schemas are `schemas/quic_metadata_protocol.capnp` and `schemas/tunnelrpc.capnp`.
 
+Both directions use the same metadata convention, and it is easy to get wrong:
+the status goes in a bare `HttpStatus` entry and **every** header must be
+`HttpHeader:<Name>` (`HttpHeader:Content-Type`, `HttpHeader:Set-Cookie`, ...).
+An unprefixed key is silently dropped by the edge, which then synthesises its own
+`Transfer-Encoding: chunked` framing and forwards no origin headers at all. The
+name casing is not significant.
+
 ## 4. Measurements in a sealed sandbox
 
 Measured on the host where `cfrs` was developed, using the route setup from
@@ -111,16 +118,26 @@ The consequences are direct:
   `--url` that triggers quick-tunnel mode, and quick-tunnel mode is only
   triggered by `--url` or `--hello-world`. `cfrs` sidesteps that by running the
   protocol itself.
-- A quick tunnel also needs a locally served origin; the built-in
-  `--hello-world` origin binds TCP and therefore cannot start here.
+- `cloudflared`'s built-in `--hello-world` origin binds TCP and therefore cannot
+  start here. `cfrs`'s built-in origins (`hello_world`, `http_status:NNN`,
+  `static:`, `spa:`, `metrics`, share sessions) run in-process and need no
+  listener.
 
 ## 5. Reproducing the proof
 
-`cfrs --demo --exit-on-verify` does all of it: it binds an `AF_UNIX` HTTP origin,
-provisions a quick tunnel against `api.trycloudflare.com` (443), registers over
-QUIC to the edge (UDP 7844), then fetches the public `https://<random>.trycloudflare.com`
-URL and checks that the response contains the origin's random token. A run
-prints the public URL, the edge POP, and `PROOF ... HTTP 200`.
+`cfrs demo --exit-on-verify` does all of it: it serves a built-in origin, provisions
+a quick tunnel against `api.trycloudflare.com` (443), registers over QUIC to the
+edge (UDP 7844), then fetches the public
+`https://<random>.trycloudflare.com` URL and checks the body. A run prints the
+public URL, the edge POP, and `PROOF ... HTTP 200`.
+
+The unix-origin path is checked separately by pointing the tunnel at a socket:
+
+```sh
+python3 /tmp/uo.py /tmp/uo.sock           # any HTTP server on AF_UNIX
+cfrs tunnel --unix /tmp/uo.sock
+curl -sS -i https://<random>.trycloudflare.com/hello
+```
 
 For comparison, the reference binary reproduces the transport finding but not
 the unix origin:
@@ -134,3 +151,21 @@ cloudflared tunnel --url http://127.0.0.1:8080
 printf 'ingress:\n  - service: unix:/tmp/origin.sock\n' > cf.yml
 cloudflared tunnel --config cf.yml --url http://placeholder.invalid --protocol quic
 ```
+
+## 6. The service layer
+
+Everything above is the transport. On top of it `cfrs` implements the parts a
+`cloudflared` user expects, plus the quickbridge session model:
+
+- **Ingress.** Ordered rules matched by hostname (exact and single-label `*`)
+  and path prefix, cloudflared-style YAML, per-rule `originRequest` options.
+- **Origins.** HTTP/HTTPS, `AF_UNIX`, `unix+tls:`, raw TCP, static directories
+  with SPA fallback, fixed status codes, hello world, Prometheus metrics.
+- **HA.** `ha-connections` registers several QUIC legs with distinct
+  `conn_index` values; each leg has its own reactor and reconnects with
+  exponential backoff and `replace_existing`.
+- **Sessions.** `share` serves an axum router for multipart uploads and streamed
+  downloads, with a 6-digit PIN exchanged for a `cfrs_pin` cookie, an
+  unguessable `/s/<token>/` path, size and file caps, and stop-after/idle
+  controls. Proxy sessions are forwarded through the same raw HTTP path as any
+  other origin, with the gate applied first.
