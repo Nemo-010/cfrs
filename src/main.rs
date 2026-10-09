@@ -10,8 +10,10 @@ use tracing_subscriber::EnvFilter;
 
 use cfrs::config::{load_file, Config};
 use cfrs::gate::Gate;
-use cfrs::ingress::{Ingress, OriginOptions, Service};
+use cfrs::ingress::{ForwardTarget, Ingress, IngressRule, OriginOptions, Service};
+use cfrs::net::BoxedIo;
 use cfrs::share::{ShareConfig, ShareControl, ShareMode};
+use cfrs::ws::{self, LocalSpec};
 use cfrs::{Protocol, Tunnel};
 
 #[derive(Parser, Debug)]
@@ -29,6 +31,8 @@ enum Command {
     Serve(ServeArgs),
     /// Upload / download / proxy session (quickbridge-style).
     Share(ShareArgs),
+    /// Bridge a local socket to a remote WebSocket forward endpoint.
+    Connect(ConnectArgs),
     /// List local TCP ports that are listening.
     Ports,
     /// Print a QR code for a URL.
@@ -91,6 +95,9 @@ struct TunnelArgs {
     /// Raw TCP origin.
     #[arg(long)]
     tcp: Option<String>,
+    /// Expose a raw stream over a WebSocket endpoint (tcp://host:port or unix:/path).
+    #[arg(long)]
+    forward: Option<String>,
     /// cloudflared's built-in hello world.
     #[arg(long)]
     hello_world: bool,
@@ -109,6 +116,9 @@ struct TunnelArgs {
     /// Override the Host header sent to the origin.
     #[arg(long)]
     http_host_header: Option<String>,
+    /// Drop Accept-Encoding so the origin cannot compress a streaming response.
+    #[arg(long)]
+    strip_accept_encoding: bool,
 }
 
 #[derive(Args, Debug)]
@@ -164,6 +174,18 @@ struct ShareArgs {
 }
 
 #[derive(Args, Debug)]
+struct ConnectArgs {
+    /// Public WebSocket URL, e.g. wss://<host>/__cfrs/ws.
+    remote: String,
+    /// Local listeners, repeatable: tcp://[bind:]port or unix:///path.
+    #[arg(short = 'L', long = "local", required = true)]
+    locals: Vec<String>,
+    /// Stay up for this many seconds instead of until Ctrl-C.
+    #[arg(long)]
+    run_for: Option<u64>,
+}
+
+#[derive(Args, Debug)]
 struct QrArgs {
     /// URL to encode.
     url: String,
@@ -193,6 +215,7 @@ async fn main() -> Result<()> {
         Command::Tunnel(args) => tunnel(args).await,
         Command::Serve(args) => serve(args).await,
         Command::Share(args) => share(args).await,
+        Command::Connect(args) => connect(args).await,
         Command::Ports => {
             for port in cfrs::ports::listening_ports() {
                 println!("{port}");
@@ -220,25 +243,53 @@ async fn tunnel(args: TunnelArgs) -> Result<()> {
     }
 
     if args.config.is_none() {
-        let service = pick_service(&args)?;
-        let origin = OriginOptions {
-            no_tls_verify: args.no_tls_verify,
-            http_host_header: args.http_host_header.clone(),
-            ..OriginOptions::default()
-        };
-        config.ingress = Ingress::new().rule_with(cfrs::ingress::IngressRule {
-            hostname: None,
-            path: None,
-            service,
-            origin,
-        });
+        let mut ingress = Ingress::new();
+        if let Some(forward) = &args.forward {
+            let target = ForwardTarget::parse(forward)?;
+            ingress = ingress.rule_with(IngressRule {
+                hostname: None,
+                path: Some(cfrs::ws::DEFAULT_PATH.to_string()),
+                service: Service::Forward(target),
+                origin: OriginOptions::default(),
+            });
+        }
+        if let Some(service) = pick_optional_service(&args)? {
+            let origin = OriginOptions {
+                no_tls_verify: args.no_tls_verify,
+                http_host_header: args.http_host_header.clone(),
+                strip_accept_encoding: args.strip_accept_encoding,
+                ..OriginOptions::default()
+            };
+            ingress = ingress.rule_with(IngressRule {
+                hostname: None,
+                path: None,
+                service,
+                origin,
+            });
+        }
+        if ingress.is_empty() {
+            bail!(
+                "choose an origin (--url, --unix, --port, --tcp, --hello-world) or --forward"
+            );
+        }
+        config.ingress = ingress;
     }
     config = args.common.apply(config)?;
+    // A forward-only tunnel has no HTTP origin to verify; the root is expected
+    // to answer 503.
+    if !config
+        .ingress
+        .rules
+        .iter()
+        .any(|rule| !matches!(rule.service, Service::Forward(_)))
+    {
+        config.verify = false;
+    }
 
     run_tunnel(config, args.common.qr, args.common.run_for, vec![]).await
 }
 
-fn pick_service(args: &TunnelArgs) -> Result<Service> {
+fn pick_optional_service(args: &TunnelArgs) -> Result<Option<Service>> {
     let mut choices = 0;
     let mut service = None;
     if let Some(url) = &args.url {
@@ -261,10 +312,102 @@ fn pick_service(args: &TunnelArgs) -> Result<Service> {
         choices += 1;
         service = Some(Service::HelloWorld);
     }
-    if choices != 1 {
-        bail!("choose exactly one origin: --url, --unix, --port, --tcp, --hello-world, or --config");
+    if choices > 1 {
+        bail!("choose at most one origin: --url, --unix, --port, --tcp, --hello-world");
     }
-    Ok(service.expect("checked above"))
+    Ok(service)
+}
+
+async fn connect(args: ConnectArgs) -> Result<()> {
+    cfrs::init_crypto();
+    let mut tasks = Vec::new();
+    for raw in &args.locals {
+        let local = LocalSpec::parse(raw)?;
+        let remote = args.remote.clone();
+        match local {
+            LocalSpec::Tcp { bind, port } => {
+                let listener = tokio::net::TcpListener::bind((bind.as_str(), port))
+                    .await
+                    .with_context(|| format!("binding {bind}:{port}"))?;
+                println!("cfrs: {} -> {remote}", LocalSpec::Tcp { bind: bind.clone(), port }.describe());
+                tasks.push(tokio::spawn(accept_loop(listener, remote)));
+            }
+            LocalSpec::Unix(path) => {
+                #[cfg(unix)]
+                {
+                    let listener = unix_listener(&path)?;
+                    println!("cfrs: {} -> {remote}", LocalSpec::Unix(path.clone()).describe());
+                    tasks.push(tokio::spawn(accept_unix(listener, remote)));
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = remote;
+                    bail!(
+                        "unix sockets are not supported on this platform: {}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+    match args.run_for {
+        Some(secs) => tokio::time::sleep(Duration::from_secs(secs)).await,
+        None => {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+    for task in tasks {
+        task.abort();
+    }
+    Ok(())
+}
+
+async fn accept_loop(listener: tokio::net::TcpListener, remote: String) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _peer)) => {
+                let remote = remote.clone();
+                tokio::spawn(async move {
+                    let io: BoxedIo = Box::new(stream);
+                    if let Err(err) = ws::connect_bridge(&remote, io).await {
+                        tracing::warn!(error = %format!("{err:#}"), "forward connection failed");
+                    }
+                });
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "accept failed");
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn unix_listener(path: &std::path::Path) -> Result<tokio::net::UnixListener> {
+    let _ = std::fs::remove_file(path);
+    tokio::net::UnixListener::bind(path)
+        .with_context(|| format!("binding unix:{}", path.display()))
+}
+
+#[cfg(unix)]
+async fn accept_unix(listener: tokio::net::UnixListener, remote: String) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _peer)) => {
+                let remote = remote.clone();
+                tokio::spawn(async move {
+                    let io: BoxedIo = Box::new(stream);
+                    if let Err(err) = ws::connect_bridge(&remote, io).await {
+                        tracing::warn!(error = %format!("{err:#}"), "forward connection failed");
+                    }
+                });
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "accept failed");
+                return;
+            }
+        }
+    }
 }
 
 async fn serve(args: ServeArgs) -> Result<()> {

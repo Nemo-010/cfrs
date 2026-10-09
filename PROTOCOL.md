@@ -100,18 +100,23 @@ Measured on the host where `cfrs` was developed, using the route setup from
 
 | probe | result |
 | --- | --- |
-| outbound TCP to `github.com:{22,53,80,7844,8080,8443}` | `connect: Permission denied` |
+| outbound TCP to `github.com:{22,53,80,7844,8080,8443}` | `connect: Permission denied` (`EACCES`, errno 13) |
 | outbound TCP to any host `:443` | works |
+| outbound TCP to `127.0.0.1:{22,53,3128,8080,8888,1080}` | `EACCES` — the filter is on the **port**, not the host |
+| outbound TCP to `127.0.0.1:443` | allowed by the filter, `ECONNREFUSED` — no local proxy to `CONNECT` through |
 | outbound UDP to edge `:7844` | works — `cloudflared` precheck: `QUIC connection successful` |
+| TLS to the tunnel anycast on `:443` (SNI `h2.cftunnel.com`) | legacy `CN=ssl881653.cloudflaressl.com`, expired 2020 — not the tunnel service |
 | `bind(2)` `AF_INET` `127.0.0.1:0`, `0.0.0.0:0`, `[::1]:0` | `EACCES` |
 | `bind(2)` `AF_UNIX` | works |
 | `POST https://api.trycloudflare.com/tunnel` | HTTP 200, real hostname + credentials |
-| TLS to the tunnel anycast on `:443` (SNI `h2.cftunnel.com`) | legacy 2020 certificate, not the tunnel service |
 
 The consequences are direct:
 
 - The HTTP/2 transport is dead here (TCP 7844 blocked), and the tunnel service
   is not served on 443. **QUIC over UDP 7844 is the only viable transport.**
+  The `socat`-relay-plus-`HTTP CONNECT`-egress-proxy recipe does not apply:
+  the connect filter rejects every non-443 port before a proxy could be reached,
+  and there is no proxy on 443.
 - No TCP listener can be created, so the origin must be `AF_UNIX`. `cloudflared`
   itself can only expose a unix origin through a config-file ingress
   (`service: unix:/path`); `--unix-socket` is mutually exclusive with the
@@ -122,6 +127,8 @@ The consequences are direct:
   start here. `cfrs`'s built-in origins (`hello_world`, `http_status:NNN`,
   `static:`, `spa:`, `metrics`, share sessions) run in-process and need no
   listener.
+- The connect filter does **not** stop WebSocket upgrades, so the HTTP-only
+  limit is removable even here — see section 7.
 
 ## 5. Reproducing the proof
 
@@ -169,3 +176,26 @@ Everything above is the transport. On top of it `cfrs` implements the parts a
   unguessable `/s/<token>/` path, size and file caps, and stop-after/idle
   controls. Proxy sessions are forwarded through the same raw HTTP path as any
   other origin, with the gate applied first.
+
+## 7. Raw streams over the HTTP tunnel
+
+A quick tunnel is HTTP, but the edge proxies WebSocket upgrades, and a WebSocket
+is a bidirectional byte pipe with message framing. `cfrs` uses that to carry
+anything:
+
+- The origin exposes `/__cfrs/ws` (`Service::Forward`). The edge delivers the
+  upgrade as `ConnectionType::Websocket`; the origin computes
+  `Sec-WebSocket-Accept = base64(sha1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))`,
+  answers `101`, and then treats the rest of the stream as WebSocket frames
+  (`tokio-tungstenite`, server role).
+- One WebSocket message maps to one write on the target stream, so framing and
+  back-pressure survive.
+- `cfrs connect` is the far side: it accepts local `tcp://`/`unix://`
+  connections and opens one WebSocket per connection, then pumps bytes. This is
+  the websocat / wstunnel model, and it is what makes `--forward` useful for
+  SSH, databases, unix sockets and any other raw protocol.
+
+Measured end to end through a live quick tunnel: a local unix socket carried an
+HTTP GET and POST (including a 64 KiB body) to an origin `AF_UNIX` socket and
+back, with byte-for-byte framing. The connect filter never sees a new port, so
+this works in the sealed sandbox too.

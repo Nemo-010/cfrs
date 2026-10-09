@@ -5,7 +5,9 @@ use std::sync::{Arc, Once, OnceLock};
 
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpStream, UnixStream};
+use tokio::net::TcpStream;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio_rustls::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
 };
@@ -45,19 +47,14 @@ pub async fn dial(service: &Service, options: &OriginOptions) -> Result<BoxedIo>
                     Ok(Box::new(tcp) as BoxedIo)
                 }
             }
-            Service::Unix(path) => UnixStream::connect(path)
-                .await
-                .map(|s| Box::new(s) as BoxedIo)
-                .with_context(|| format!("connecting to unix:{}", path.display())),
-            Service::UnixTls(path) => {
-                let stream = UnixStream::connect(path)
-                    .await
-                    .with_context(|| format!("connecting to unix:{}", path.display()))?;
-                tls_wrap(stream, "localhost", options.no_tls_verify).await
-            }
+            Service::Unix(path) => dial_unix(path, false, options).await,
+            Service::UnixTls(path) => dial_unix(path, true, options).await,
             Service::Tcp(addr) => TcpStream::connect(addr.as_str())
                 .await
-                .map(|s| Box::new(s) as BoxedIo)
+                .map(|s| {
+                    let _ = s.set_nodelay(true);
+                    Box::new(s) as BoxedIo
+                })
                 .with_context(|| format!("connecting to {addr}")),
             other => bail!("{} is not a forward service", other.describe()),
         }
@@ -68,6 +65,35 @@ pub async fn dial(service: &Service, options: &OriginOptions) -> Result<BoxedIo>
             .map_err(|_| anyhow::anyhow!("origin connect timed out after {limit:?}"))?,
         None => connect.await,
     }
+}
+
+/// Dial a filesystem socket, optionally wrapping it in TLS.
+#[cfg(unix)]
+async fn dial_unix(
+    path: &std::path::Path,
+    tls: bool,
+    options: &OriginOptions,
+) -> Result<BoxedIo> {
+    let stream = UnixStream::connect(path)
+        .await
+        .with_context(|| format!("connecting to unix:{}", path.display()))?;
+    if tls {
+        tls_wrap(stream, "localhost", options.no_tls_verify).await
+    } else {
+        Ok(Box::new(stream) as BoxedIo)
+    }
+}
+
+#[cfg(not(unix))]
+async fn dial_unix(
+    path: &std::path::Path,
+    _tls: bool,
+    _options: &OriginOptions,
+) -> Result<BoxedIo> {
+    bail!(
+        "unix sockets are not supported on this platform: {}",
+        path.display()
+    )
 }
 
 /// Parse `http(s)://host[:port]` into `(host, port, tls)`.
@@ -211,7 +237,6 @@ pub fn origin_label(service: &Service) -> String {
 /// Keep `PathBuf` referenced so the import is used on every platform.
 #[allow(dead_code)]
 fn _pathbuf(_: PathBuf) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -9,7 +9,7 @@ use axum::Router;
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::gate::Gate;
-use crate::ingress::{Ingress, OriginOptions, Service};
+use crate::ingress::{ForwardTarget, Ingress, OriginOptions, Service};
 use crate::metrics::Metrics;
 use crate::share::{ShareApp, ShareControl, ShareMode};
 
@@ -19,6 +19,8 @@ pub enum Built {
     Forward(Service, OriginOptions),
     /// Raw TCP origin.
     Tcp(Service, OriginOptions),
+    /// WebSocket endpoint bridging to a raw stream target.
+    ForwardWs(ForwardTarget),
     HelloWorld,
     Status(u16),
     Static(Router),
@@ -48,6 +50,7 @@ impl ServiceRuntime {
                     Built::Forward(rule.service.clone(), rule.origin.clone())
                 }
                 Service::Tcp(_) => Built::Tcp(rule.service.clone(), rule.origin.clone()),
+                Service::Forward(target) => Built::ForwardWs(target.clone()),
                 Service::HelloWorld => Built::HelloWorld,
                 Service::Status(code) => Built::Status(*code),
                 Service::Static { root, spa } => Built::Static(static_router(root, *spa)?),

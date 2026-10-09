@@ -13,6 +13,7 @@ adds a full service layer on top:
 | `cfrs tunnel` | Expose an HTTP(S) origin, a unix socket, a raw TCP port, `hello_world`, a fixed status, a directory, metrics, or a cloudflared-style YAML config. |
 | `cfrs serve` | Serve a directory (optionally with SPA fallback) over a quick or named tunnel. |
 | `cfrs share` | Upload / download / proxy session with a 6-digit PIN gate, an unguessable path, size caps, stop-after-transfer and idle timeout. |
+| `cfrs connect` | Turn a local socket into a connection through the tunnel's WebSocket forward endpoint, so raw TCP/HTTP/SSH/etc. can cross a quick tunnel. |
 | `cfrs ports` | List local listening TCP ports (Linux `/proc/net/tcp{,6}`). |
 | `cfrs qr` | Render a URL as a terminal QR code. |
 | `cfrs demo` | Self-contained proof: a built-in origin, a quick tunnel, then a fetch of the public URL. |
@@ -26,7 +27,9 @@ cargo build --release
 # ./target/release/cfrs
 ```
 
-Requires Rust 1.86 or newer.
+Requires Rust 1.86 or newer. Unix-socket origins (`--unix`, `unix://`) are
+only available on unix-like hosts; `--url`, `--port`, `--tcp` and
+`--forward tcp://` work everywhere.
 
 ## Prove it works
 
@@ -133,6 +136,32 @@ Uploads are capped (512 MiB per file, 32 files by default), filenames are
 sanitized and made unique, and `--stop-after` ends the session after the first
 successful transfer. `--idle-secs` ends it after inactivity.
 
+## Carry anything over the tunnel
+
+A quick tunnel is an HTTP tunnel, but it proxies WebSocket upgrades, and a
+WebSocket is a byte pipe. `--forward` exposes one, and `cfrs connect` turns a
+local socket into connections through it. This is the websocat / wstunnel idea,
+and it removes the HTTP-only limit:
+
+```sh
+# sandbox / server side: expose a unix socket (or tcp://host:port)
+cfrs tunnel --forward unix:/run/myapp.sock
+#   cfrs: public   https://<random>.trycloudflare.com
+
+# your machine: local port 8080 reaches that unix socket
+cfrs connect wss://<random>.trycloudflare.com/__cfrs/ws -L tcp://127.0.0.1:8080
+```
+
+`-L` is repeatable, and accepts `tcp://[bind:]port` and `unix:///path`. Every
+accepted local connection opens its own WebSocket, so framing is preserved and
+interactive protocols work. Combine `--forward` with a normal origin by giving
+both: the forward endpoint lives at `/__cfrs/ws`, the origin gets everything
+else.
+
+```sh
+cfrs tunnel --url http://127.0.0.1:3000 --forward tcp://127.0.0.1:5432
+```
+
 ## Sandboxes and unusual hosts
 
 `cfrs` is built for hosts where the usual tunnel recipe does not fit:
@@ -144,6 +173,32 @@ successful transfer. `--idle-secs` ends it after inactivity.
   hard-coded address.
 - **No `cloudflared`.** The protocol is implemented in-process, so the host needs
   no Go binary and no extra privileges.
+- **Arbitrary streams over the HTTP tunnel.** Where a host can only be reached
+  over a WebSocket, `--forward` + `cfrs connect` carry raw TCP, unix sockets and
+  interactive protocols anyway.
+
+### What a sealed sandbox still blocks
+
+Some limits are kernel policy, not missing code. Measured on the host where
+`cfrs` was developed:
+
+- `connect(2)` to any port other than **443** fails with `EACCES`, including
+  `127.0.0.1:22`. A local HTTP `CONNECT` proxy on `127.0.0.1:443` would be the
+  way around it, but nothing listens there (`ECONNREFUSED`), and no proxy is on
+  an allowed port.
+- The edge's HTTP/2 transport is on TCP **7844**, which is `EACCES` here, and
+  the tunnel service is not served on 443 (that port answers with a legacy 2020
+  certificate). So `--protocol http2` is implemented for normal hosts but is
+  unusable from this sandbox; QUIC over UDP 7844 is.
+- `bind(2)` on `AF_INET` fails with `EACCES`; `AF_UNIX` works. That is why
+  `--unix` exists and why `cfrs connect` can use `unix://` locally here.
+
+### Streaming
+
+Response bodies are streamed as they arrive. Cloudflare's edge has one quirk:
+`text/event-stream` over **POST** streams incrementally, but over **GET** it is
+buffered until the origin closes. `--strip-accept-encoding` keeps the origin
+from compressing a stream so the edge cannot buffer it.
 
 ## How it works
 

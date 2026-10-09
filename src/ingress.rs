@@ -8,6 +8,49 @@ use serde::Deserialize;
 
 use crate::share::ShareConfig;
 
+/// A raw stream target for [`Service::Forward`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ForwardTarget {
+    /// A TCP `host:port`.
+    Tcp(String),
+    /// A filesystem socket.
+    Unix(PathBuf),
+}
+
+impl ForwardTarget {
+    /// Parse `tcp://host:port`, `tcp:host:port`, `unix:/path` or `unix:///path`.
+    pub fn parse(value: &str) -> Result<Self> {
+        let value = value.trim();
+        for prefix in ["tcp://", "tcp:"] {
+            if let Some(rest) = value.strip_prefix(prefix) {
+                if rest.is_empty() {
+                    bail!("forward target has no address: {value:?}");
+                }
+                return Ok(Self::Tcp(rest.to_string()));
+            }
+        }
+        for prefix in ["unix://", "unix:"] {
+            if let Some(rest) = value.strip_prefix(prefix) {
+                if rest.is_empty() {
+                    bail!("forward target has no path: {value:?}");
+                }
+                return Ok(Self::Unix(PathBuf::from(rest)));
+            }
+        }
+        if value.contains(':') {
+            return Ok(Self::Tcp(value.to_string()));
+        }
+        bail!("forward target must be tcp://host:port or unix:/path, got {value:?}")
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Tcp(addr) => format!("tcp://{addr}"),
+            Self::Unix(path) => format!("unix:{}", path.display()),
+        }
+    }
+}
+
 /// A local service the tunnel can expose.
 #[derive(Clone, Debug)]
 pub enum Service {
@@ -19,6 +62,8 @@ pub enum Service {
     UnixTls(PathBuf),
     /// A raw TCP origin (`tcp://host:port`), proxied byte-for-byte.
     Tcp(String),
+    /// A WebSocket endpoint that bridges each connection to a raw stream.
+    Forward(ForwardTarget),
     /// cloudflared's built-in hello world.
     HelloWorld,
     /// A fixed status code.
@@ -50,6 +95,9 @@ impl Service {
         }
         if let Some(rest) = value.strip_prefix("tcp://") {
             return Ok(Service::Tcp(rest.to_string()));
+        }
+        if let Some(rest) = value.strip_prefix("forward:") {
+            return Ok(Service::Forward(ForwardTarget::parse(rest)?));
         }
         if let Some(rest) = value.strip_prefix("static:") {
             return Ok(Service::Static {
@@ -83,6 +131,7 @@ impl Service {
             Service::Unix(path) => format!("unix:{}", path.display()),
             Service::UnixTls(path) => format!("unix+tls:{}", path.display()),
             Service::Tcp(addr) => format!("tcp://{addr}"),
+            Service::Forward(target) => format!("forward:{}", target.describe()),
             Service::HelloWorld => "hello_world".into(),
             Service::Status(code) => format!("http_status:{code}"),
             Service::Static { root, spa } => {
@@ -109,6 +158,10 @@ pub struct OriginOptions {
     pub tls_timeout: Option<Duration>,
     pub keep_alive_timeout: Option<Duration>,
     pub disable_chunked_encoding: bool,
+    /// Drop `Accept-Encoding` before the request reaches the origin. An
+    /// uncompressed response cannot be buffered by the edge, which matters for
+    /// streaming (SSE over POST, long-poll).
+    pub strip_accept_encoding: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -238,6 +291,8 @@ pub(crate) struct RawOriginOptions {
     pub keep_alive_timeout: Option<String>,
     #[serde(default, rename = "disableChunkedEncoding")]
     pub disable_chunked_encoding: bool,
+    #[serde(default, rename = "stripAcceptEncoding")]
+    pub strip_accept_encoding: bool,
 }
 
 fn parse_duration(value: &Option<String>) -> Option<Duration> {
@@ -273,6 +328,7 @@ impl RawOriginOptions {
             tls_timeout: parse_duration(&self.tls_timeout),
             keep_alive_timeout: parse_duration(&self.keep_alive_timeout),
             disable_chunked_encoding: self.disable_chunked_encoding,
+            strip_accept_encoding: self.strip_accept_encoding,
         }
     }
 }

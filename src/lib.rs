@@ -33,12 +33,14 @@ pub mod service;
 pub mod share;
 pub mod tunnel;
 pub mod util;
+pub mod ws;
 
 pub use config::{Config, Credentials, Protocol, ReconnectPolicy};
-pub use ingress::{Ingress, IngressRule, OriginOptions, Service};
+pub use ingress::{ForwardTarget, Ingress, IngressRule, OriginOptions, Service};
 pub use metrics::{Metrics, MetricsSnapshot};
 pub use share::{ShareApp, ShareConfig, ShareControl, ShareMode};
 pub use tunnel::{Tunnel, TunnelBuilder, TunnelHandle};
+pub use ws::LocalSpec;
 
 /// Install the rustls crypto provider. Called automatically by
 /// [`Tunnel::start`]; call it early if you build TLS yourself.

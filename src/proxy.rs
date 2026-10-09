@@ -24,8 +24,8 @@ use crate::util::path_and_query;
 
 const MAX_HEAD_BYTES: usize = 32 * 1024;
 
-type EdgeReader = Compat<quinn::RecvStream>;
-type EdgeWriter = Compat<quinn::SendStream>;
+pub(crate) type EdgeReader = Compat<quinn::RecvStream>;
+pub(crate) type EdgeWriter = Compat<quinn::SendStream>;
 
 /// Handle one inbound stream. Errors are logged, never propagated to the edge.
 pub async fn serve_stream(
@@ -77,6 +77,19 @@ async fn serve_inner(
         }
         Built::Tcp(service, options) => {
             forward_tcp(service, options, &request, reader, writer, runtime.metrics()).await
+        }
+        Built::ForwardWs(target) => {
+            if !is_websocket(&request) {
+                let mut writer = writer;
+                return write_simple_response(
+                    &mut writer,
+                    426,
+                    "text/plain; charset=utf-8",
+                    b"cfrs: this endpoint requires a WebSocket upgrade\n",
+                )
+                .await;
+            }
+            crate::ws::serve_websocket(target, &request, reader, writer, runtime.metrics()).await
         }
         Built::HelloWorld => {
             let mut writer = writer;
@@ -524,7 +537,7 @@ fn response_meta_pairs(status: u16, headers: &[(String, String)]) -> Vec<(String
     meta
 }
 
-async fn write_response_meta(
+pub(crate) async fn write_response_meta(
     writer: &mut EdgeWriter,
     status: u16,
     headers: &[(String, String)],
@@ -569,6 +582,9 @@ fn build_request_head(
         if name.eq_ignore_ascii_case("host") {
             continue;
         }
+        if options.strip_accept_encoding && name.eq_ignore_ascii_case("accept-encoding") {
+            continue;
+        }
         if name.eq_ignore_ascii_case("connection") {
             saw_connection = true;
         }
@@ -592,7 +608,7 @@ fn request_path(dest: &str) -> String {
     path_and_query(dest)
 }
 
-fn header_value<'a>(request: &'a cqstream::ConnectRequest, name: &str) -> Option<&'a str> {
+pub(crate) fn header_value<'a>(request: &'a cqstream::ConnectRequest, name: &str) -> Option<&'a str> {
     let prefix = format!("{HTTP_HEADER_KEY}:");
     request.metadata.iter().find_map(|(key, value)| {
         key.strip_prefix(&prefix)
@@ -616,6 +632,12 @@ fn is_upgrade(request: &cqstream::ConnectRequest) -> bool {
         || header_value(request, "connection")
             .map(|v| v.to_ascii_lowercase().contains("upgrade"))
             .unwrap_or(false)
+}
+
+/// The edge marks an upgrade by connection type, and may not keep the
+/// `Upgrade`/`Connection` headers in the metadata, so check both.
+fn is_websocket(request: &cqstream::ConnectRequest) -> bool {
+    request.conn_type == cqstream::ConnectionType::Websocket || is_upgrade(request)
 }
 
 fn is_hop_by_hop(name: &str) -> bool {
@@ -845,6 +867,20 @@ mod tests {
         assert!(fields.contains(&("password".to_string(), "123456".to_string())));
         assert!(fields.contains(&("next".to_string(), "/s/abc/".to_string())));
         assert!(fields.contains(&("x".to_string(), "a b".to_string())));
+    }
+
+    #[test]
+    fn strips_accept_encoding_on_request() {
+        let request = req("https://x/", vec![("HttpHeader:Accept-Encoding", "gzip, br")]);
+        let head = build_request_head(&request, &OriginOptions::default(), false);
+        assert!(head.contains("Accept-Encoding: gzip, br"));
+
+        let options = OriginOptions {
+            strip_accept_encoding: true,
+            ..OriginOptions::default()
+        };
+        let head = build_request_head(&request, &options, false);
+        assert!(!head.to_ascii_lowercase().contains("accept-encoding"));
     }
 
     #[test]
