@@ -1,0 +1,42 @@
+[package]
+name = "cfrs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.86"
+license = "0BSD"
+description = "Expose a local unix-socket or TCP HTTP server on the public Electrosphere through an anonymous Cloudflare quick tunnel, from a single Rust binary."
+repository = "https://github.com/Nemo-010/cfrs"
+readme = "README.md"
+keywords = ["cloudflare", "tunnel", "trycloudflare", "quic", "unix-socket"]
+categories = ["network-programming", "command-line-utilities"]
+
+[[bin]]
+name = "cfrs"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+cloudflare-quick-tunnel = "=0.3.1"
+futures = "0.3"
+httparse = "1"
+quinn = "0.11"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "io-util",
+    "net",
+    "time",
+    "sync",
+    "signal",
+    "fs",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
