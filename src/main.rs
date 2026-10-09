@@ -1,5 +1,6 @@
 //! cfrs command line.
 
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +16,7 @@ use cfrs::net::BoxedIo;
 use cfrs::share::{ShareConfig, ShareControl, ShareMode};
 use cfrs::ws::{self, LocalSpec};
 use cfrs::{Protocol, Tunnel};
+use cfrs::vnet::{VirtAddr, VirtualSubnet};
 
 #[derive(Parser, Debug)]
 #[command(name = "cfrs", version, about = "Expose anything on the public Electrosphere through Cloudflare tunnels")]
@@ -39,6 +41,8 @@ enum Command {
     Qr(QrArgs),
     /// Self-contained proof: built-in origin, tunnel, then fetch the URL.
     Demo(DemoArgs),
+    /// Userspace virtual networking (no kernel interfaces).
+    Net(NetArgs),
 }
 
 #[derive(Args, Clone, Debug)]
@@ -227,6 +231,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Demo(args) => demo(args).await,
+        Command::Net(args) => net(args).await,
     }
 }
 
@@ -655,3 +660,229 @@ async fn wait_controls(controls: Vec<Arc<ShareControl>>) {
 fn _mode(mode: ShareMode) -> ShareMode {
     mode
 }
+
+// ── userspace virtual networking ─────────────────────────────────────────────
+
+#[derive(Args, Debug)]
+struct NetArgs {
+    #[command(subcommand)]
+    command: NetCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum NetCommand {
+    /// Prove the userspace TCP handshake + transfer in-process.
+    Demo,
+    /// Probe what this host permits (the measured constraint table).
+    Doctor,
+    /// Build (or locate) the LD_PRELOAD shim and print how to use it.
+    Shim(ShimArgs),
+    /// Print the default virtual address plan.
+    Addresses,
+    /// Run a SOCKS5 / HTTP CONNECT proxy into the virtual network.
+    Proxy(ProxyArgs),
+}
+
+#[derive(Args, Debug)]
+struct ShimArgs {
+    /// Directory to write and compile the shim into when none is found.
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// Log every translation the shim performs.
+    #[arg(long)]
+    log: bool,
+    /// Rewrite 127.0.0.1 connections to the stack's local address.
+    #[arg(long)]
+    map_loopback: bool,
+    /// Print the environment as JSON instead of shell assignments.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
+struct ProxyArgs {
+    /// Where to accept proxy clients: unix:/path or tcp://[bind:]port.
+    #[arg(long, default_value = "unix:/tmp/cfrsnet.socks")]
+    listen: String,
+    /// Name-to-address entries, repeatable: --map web=10.66.0.2
+    #[arg(long = "map", value_name = "NAME=ADDR")]
+    maps: Vec<String>,
+    /// Forward a virtual endpoint to a real one, repeatable. REAL is
+    /// host:port for TCP, or unix:/path for a unix service:
+    /// --forward 10.66.0.2:8080=127.0.0.1:3000
+    #[arg(long = "forward", value_name = "VIRT=REAL")]
+    forwards: Vec<String>,
+    /// Port to use when a client omits one.
+    #[arg(long, default_value_t = 80)]
+    port: u16,
+    /// Stay up for this many seconds instead of until Ctrl-C.
+    #[arg(long)]
+    run_for: Option<u64>,
+}
+
+async fn net(args: NetArgs) -> Result<()> {
+    match args.command {
+        NetCommand::Demo => {
+            let report = cfrs::vnet::stack::loopback_proof();
+            print!("{}", report.render());
+            if !report.passed() {
+                bail!("userspace TCP proof did not complete");
+            }
+            Ok(())
+        }
+        NetCommand::Doctor => {
+            let probes = cfrs::vnet::doctor::run();
+            print!("{}", cfrs::vnet::doctor::render(&probes));
+            if cfrs::vnet::doctor::ready(&probes) {
+                println!("\ncfrsnet: ready");
+            } else {
+                println!("\ncfrsnet: not ready");
+            }
+            Ok(())
+        }
+        NetCommand::Shim(args) => net_shim(args),
+        NetCommand::Addresses => {
+            let subnet = VirtualSubnet::default();
+            println!("cfrsnet: v4 subnet {}", subnet.v4);
+            println!("cfrsnet: v6 subnet {}", subnet.v6);
+            println!("cfrsnet: gateway  {} / {}", subnet.gateway(cfrs::vnet::Family::V4), subnet.gateway(cfrs::vnet::Family::V6));
+            for port in [53u16, 80, 443, 8080] {
+                let addr = VirtAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(10, 66, 0, 2)), port);
+                println!("cfrsnet: {addr:<20} \\0{}", addr.abstract_name()?);
+            }
+            Ok(())
+        }
+        NetCommand::Proxy(args) => net_proxy(args).await,
+    }
+}
+
+fn net_shim(args: ShimArgs) -> Result<()> {
+    let directory = args
+        .out
+        .clone()
+        .unwrap_or_else(|| std::env::temp_dir().join("cfrsnet"));
+    let shim = match cfrs::vnet::shim::locate() {
+        Some(shim) if args.out.is_none() => shim,
+        _ => cfrs::vnet::shim::build(&directory)?,
+    };
+    let options = cfrs::vnet::shim::ShimOptions {
+        log: args.log,
+        map_loopback: args.map_loopback,
+        ..cfrs::vnet::shim::ShimOptions::default()
+    };
+    let env = options.environment(&shim.path);
+    if args.json {
+        let object: serde_json::Map<String, serde_json::Value> = env
+            .into_iter()
+            .map(|(key, value)| (key, serde_json::Value::String(value)))
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&object)?);
+    } else {
+        println!("cfrs: shim     {}", shim.path.display());
+        println!("cfrs: origin   {:?}", shim.origin);
+        for (key, value) in &env {
+            println!("  export {key}={value}");
+        }
+    }
+    Ok(())
+}
+
+async fn net_proxy(args: ProxyArgs) -> Result<()> {
+    use cfrs::vnet::proxy::{ProxyListen, Resolver};
+
+    let net = Arc::new(cfrs::vnet::NetStack::loopback());
+    let mut resolver = Resolver::new();
+    for entry in &args.maps {
+        let (name, address) = entry
+            .split_once('=')
+            .with_context(|| format!("--map wants NAME=ADDRESS, got {entry:?}"))?;
+        resolver.insert(
+            name.trim().to_ascii_lowercase(),
+            address.trim().parse().with_context(|| format!("bad address in {entry:?}"))?,
+        );
+    }
+    let listen = ProxyListen::parse(&args.listen)?;
+    let mut proxy =
+        cfrs::vnet::proxy::serve(net.clone(), listen, resolver, args.port).await?;
+    for spec in &args.forwards {
+        let (virt, real) = spec
+            .split_once('=')
+            .with_context(|| format!("--forward wants VIRT=REAL, got {spec:?}"))?;
+        let virt: VirtAddr = virt.trim().parse()?;
+        let real = RealTarget::parse(real.trim())?;
+        let dial_real = real.clone();
+        proxy.spawn_forwards(net.clone(), virt, move || {
+            let real = dial_real.clone();
+            async move { real.dial().await }
+        });
+        println!("cfrs: forward  {virt} -> {}", real.describe());
+    }
+    match &proxy.listen {
+        ProxyListen::Unix(path) => println!("cfrs: proxy    unix:{}", path.display()),
+        ProxyListen::Tcp(addr) => println!("cfrs: proxy    tcp://{addr}"),
+    }
+    wait_stop(args.run_for).await;
+    proxy.abort();
+    Ok(())
+}
+
+async fn wait_stop(run_for: Option<u64>) {
+    match run_for {
+        Some(secs) => tokio::time::sleep(Duration::from_secs(secs)).await,
+        None => {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+}
+
+
+/// A real destination a virtual forward bridges to.
+#[derive(Clone, Debug)]
+enum RealTarget {
+    Tcp(std::net::SocketAddr),
+    #[cfg(unix)]
+    Unix(std::path::PathBuf),
+}
+
+impl RealTarget {
+    fn parse(value: &str) -> Result<Self> {
+        if let Some(path) = value.strip_prefix("unix:") {
+            #[cfg(unix)]
+            {
+                if path.is_empty() {
+                    bail!("unix: real destination has no path");
+                }
+                return Ok(Self::Unix(std::path::PathBuf::from(path)));
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = path;
+                bail!("unix destinations are not supported on this platform");
+            }
+        }
+        Ok(Self::Tcp(value.parse().with_context(|| format!("bad real address {value:?}"))?))
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Self::Tcp(addr) => addr.to_string(),
+            #[cfg(unix)]
+            Self::Unix(path) => format!("unix:{}", path.display()),
+        }
+    }
+
+    /// Open a real connection, type-erased so the forward is generic.
+    async fn dial(&self) -> std::io::Result<Box<dyn DialStream>> {
+        match self {
+            Self::Tcp(addr) => Ok(Box::new(tokio::net::TcpStream::connect(addr).await?)),
+            #[cfg(unix)]
+            Self::Unix(path) => Ok(Box::new(tokio::net::UnixStream::connect(path).await?)),
+        }
+    }
+}
+
+/// The bounds a forwarded connection must satisfy. A single local trait lets
+/// the real destination be either a TCP or a unix stream.
+trait DialStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin> DialStream for T {}

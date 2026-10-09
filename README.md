@@ -176,6 +176,10 @@ cfrs tunnel --url http://127.0.0.1:3000 --forward tcp://127.0.0.1:5432
 - **Arbitrary streams over the HTTP tunnel.** Where a host can only be reached
   over a WebSocket, `--forward` + `cfrs connect` carry raw TCP, unix sockets and
   interactive protocols anyway.
+- **A whole address space without `AF_INET`.** When the kernel refuses every
+  `bind(2)` on `AF_INET`, `cfrs net` still gives a program an IP address to bind
+  and connect on: sockets are interposed to `AF_UNIX` and a userspace stack owns
+  the addresses. See *Userspace virtual networking* below.
 
 ### What a sealed sandbox still blocks
 
@@ -199,6 +203,41 @@ Response bodies are streamed as they arrive. Cloudflare's edge has one quirk:
 `text/event-stream` over **POST** streams incrementally, but over **GET** it is
 buffered until the origin closes. `--strip-accept-encoding` keeps the origin
 from compressing a stream so the edge cannot buffer it.
+
+## Userspace virtual networking
+
+When a host refuses `AF_INET` binds entirely, `cfrs net` gives a process an
+address space anyway, without a network namespace, a TUN device or
+`CAP_NET_ADMIN`. Two layers, usable separately:
+
+1. **Socket interposition.** `cfrs net shim` builds an `LD_PRELOAD` library that
+   rewrites every `AF_INET`/`AF_INET6` socket to an `AF_UNIX` abstract socket
+   named `\0cfrsnet/<family>/<address>/<port>`. The kernel only ever sees
+   `AF_UNIX`, so an ordinary program binds and connects normally, and two
+   interposed programs talk to each other with no host process at all.
+
+   ```sh
+   cfrs net shim --out /tmp/cfrsnet --log   # prints the environment to export
+   LD_PRELOAD=/tmp/cfrsnet/libcfrsnet.so ./your-server
+   ```
+
+2. **A userspace IP stack.** `smoltcp` owns a private `10.66.0.0/24` /
+   `fd00:66::/64` network over an in-process packet queue. The stack is the
+   library type `cfrs::vnet::NetStack`, and `cfrs net proxy` exposes it to
+   programs that cannot be interposed: a SOCKS5 / HTTP `CONNECT` front door on a
+   unix socket, with virtual endpoints forwarded to real services.
+
+   ```sh
+   cfrs net proxy --forward 10.66.0.2:8080=unix:/run/app.sock
+   ALL_PROXY=socks5h:///tmp/cfrsnet.socks curl http://10.66.0.2:8080/
+   ```
+
+Other subcommands: `cfrs net demo` runs the in-process TCP handshake proof,
+`cfrs net doctor` re-runs the measured capability table below on the running
+host, and `cfrs net addresses` prints the address plan and its abstract names.
+The library half adds `vnet::dns` (a virtual resolver), `vnet::policy`
+(connect-time ACLs), `vnet::record` (pcap capture and deterministic replay) and
+`vnet::proxy`.
 
 ## How it works
 
