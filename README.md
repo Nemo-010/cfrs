@@ -57,6 +57,11 @@ while, `--exit-on-verify` exits as soon as the public URL answers. QUIC is
 UDP-only; if `--no-verify` is used and the host cannot reach `api.trycloudflare.com`
 over 443, provisioning fails before any tunnel is created.
 
+> The public URL is bound to the running process. It stops resolving the moment
+> `cfrs` exits — a later visit returns Cloudflare **Error 1033** — and every run
+> provisions a fresh random `*.trycloudflare.com` hostname, so an old URL cannot
+> be revived. Keep `cfrs` running for as long as the URL should answer.
+
 ## How it works
 
 1. `POST https://api.trycloudflare.com/tunnel` returns a tunnel id, the public
