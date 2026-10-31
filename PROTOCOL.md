@@ -113,7 +113,9 @@ Measured on the host where `cfrs` was developed, using the route setup from
 The consequences are direct:
 
 - The HTTP/2 transport is dead here (TCP 7844 blocked), and the tunnel service
-  is not served on 443. **QUIC over UDP 7844 is the only viable transport.**
+  is not served on 443. **QUIC over UDP 7844 is the only viable transport** for a
+  *direct* connection; `--transport warp` (section 8) carries the edge connection
+  on TCP 443 instead, so the port filter stops being decisive.
   The `socat`-relay-plus-`HTTP CONNECT`-egress-proxy recipe does not apply:
   the connect filter rejects every non-443 port before a proxy could be reached,
   and there is no proxy on 443.
@@ -199,3 +201,35 @@ Measured end to end through a live quick tunnel: a local unix socket carried an
 HTTP GET and POST (including a 64 KiB body) to an origin `AF_UNIX` socket and
 back, with byte-for-byte framing. The connect filter never sees a new port, so
 this works in the sealed sandbox too.
+
+## 8. Reaching the edge when 7844 is filtered: WARP
+
+Section 4 concludes that QUIC over UDP 7844 is the only viable transport, and
+that is true of a *direct* connection: the edge answers on 7844 and nowhere
+else, and `:443` with SNI `h2.cftunnel.com` serves a legacy 2020 certificate
+rather than the tunnel service.
+
+It is not the only transport once the edge connection is *carried* instead of
+dialled. `cfrs --transport warp` registers anonymously with Cloudflare WARP and
+opens a MASQUE (`CONNECT-IP`) session over HTTP/2 on TCP 443; the QUIC connection
+to the edge is then dialled through that session, by a userspace stack, so the
+host's own `connect()` never targets port 7844.
+
+- Registration is two HTTPS calls on 443: `POST /v0a2158/reg` creates the device,
+  then `PATCH /v0a2158/reg/{id}` enrols a P-256 key and switches the device from
+  `wireguard` to `masque`. The device document names the MASQUE endpoint and the
+  addresses assigned to the tunnel (`172.16.0.2`, a `2606:4700:110:...` v6
+  address).
+- The session is an HTTP/2 `CONNECT` with `cf-connect-proto: cf-connect-ip` (the
+  h2 spelling, not the HTTP/3 `:protocol` pseudo-header), and its data frames
+  carry raw IP packets. `smoltcp` above it answers ARP, owns the assigned
+  address, and runs TCP.
+- The tunnel's QUIC transport is pointed at a **local relay** instead of the
+  edge; the relay pumps the same bytes into a TCP connection opened through the
+  stack to `<edge>:7844`. That is the whole trick: the transport is unchanged,
+  only the socket it writes to is.
+
+Measured on a host with open egress, which proves the implementation and not the
+sandbox: `cfrs warp probe` reaches `1.1.1.1:443` and `198.41.192.27:7844`
+through the session, and `cfrs tunnel --hello-world --transport warp` registers
+with the edge through it and answers HTTP 200 on its public URL.

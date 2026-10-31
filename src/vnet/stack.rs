@@ -143,6 +143,12 @@ pub struct NetStats {
     pub refused: AtomicU64,
     pub closed: AtomicU64,
     pub datagrams: AtomicU64,
+    /// Inbound connections the accept queue could not take. Counted separately
+    /// from `accepted` because a drop is not an acceptance, and a counter that
+    /// silently under-reports is worse than no counter: an operator watching
+    /// `accepted` would see a number lower than the peer's connection count
+    /// with nothing indicating anything was lost.
+    pub dropped: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -152,6 +158,7 @@ pub struct NetStatsSnapshot {
     pub refused: u64,
     pub closed: u64,
     pub datagrams: u64,
+    pub dropped: u64,
 }
 
 impl NetStats {
@@ -161,6 +168,7 @@ impl NetStats {
             connected: self.connected.load(Ordering::Relaxed),
             refused: self.refused.load(Ordering::Relaxed),
             closed: self.closed.load(Ordering::Relaxed),
+            dropped: self.dropped.load(Ordering::Relaxed),
             datagrams: self.datagrams.load(Ordering::Relaxed),
         }
     }
@@ -364,6 +372,36 @@ impl AsyncWrite for TcpStream {
     }
 }
 
+impl Drop for TcpStream {
+    fn drop(&mut self) {
+        // A dropped stream must release its virtual socket, but it must not do
+        // so by closing the connection while data is still in flight.
+        //
+        // The problem this solves: without any Drop impl, dropping the handle
+        // drops `ctl_tx` and the reactor never learns about it. It watches
+        // `to_app.is_closed()` to notice that the application has gone, but
+        // `to_app` runs the other way and stays open. The socket then sits in
+        // CloseWait until the peer closes, which for two handles dropped by the
+        // same task never happens, and each such connection keeps its smoltcp
+        // socket resident for the life of the process.
+        //
+        // Why not an unconditional graceful close: a program that writes, then
+        // reads to EOF, then drops, has its own `Drop` fire before the peer's
+        // reply arrives, and a graceful close cuts the exchange short. That was
+        // observed as two tests reading an empty response.
+        //
+        // Why not an unconditional abort: an abort discards queued data, so a
+        // program that wrote and then dropped without reading loses the reply it
+        // had not collected.
+        //
+        // So the close is deferred to the reactor, which knows whether bytes
+        // were still owed in either direction, and reaped the socket either way.
+        // The handle only asks; the reactor decides.
+        let _ = self.ctl_tx.try_send(ConnCmd::Close);
+        self.kick.notify_one();
+    }
+}
+
 /// A UDP socket in the virtual network.
 pub struct UdpSocket {
     id: u32,
@@ -482,10 +520,67 @@ enum Command {
     Shutdown,
 }
 
+/// Live and high-water socket counts for one stack.
+///
+/// `live` is the number of sockets the reactor currently holds, `peak` the
+/// largest it has ever been. A `peak` that rises with every connection while
+/// `live` returns to its starting value is the signature of a set that is not
+/// being pruned.
+#[derive(Debug, Default)]
+pub struct SocketCount {
+    live: AtomicU64,
+    peak: AtomicU64,
+}
+
+impl SocketCount {
+    fn add(&self) {
+        let now = self.live.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak.fetch_max(now, Ordering::Relaxed);
+    }
+
+    fn remove(&self) {
+        // Saturating: a double remove would otherwise wrap the live count to
+        // u64::MAX and make every later observation meaningless.
+        let mut current = self.live.load(Ordering::Relaxed);
+        loop {
+            if current == 0 {
+                return;
+            }
+            match self.live.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Sockets the reactor holds right now.
+    pub fn live(&self) -> u64 {
+        self.live.load(Ordering::Relaxed)
+    }
+
+    /// The largest number of sockets ever held at once.
+    pub fn peak(&self) -> u64 {
+        self.peak.load(Ordering::Relaxed)
+    }
+}
+
 struct Core {
     iface: Interface,
     device: LinkDevice,
     sockets: SocketSet<'static>,
+    /// Live and high-water socket counts, shared with the handle.
+    ///
+    /// A `SocketSet` only grows: `add` reuses a vacant slot but nothing reclaims
+    /// one on its own, so a set that is not pruned on close grows without bound.
+    /// The set itself lives inside the reactor task, so the count is what makes
+    /// that observable from outside, and a test can assert on it instead of
+    /// inferring a leak from a connection failing later.
+    socket_count: Arc<SocketCount>,
     clock: Clock,
     config: StackConfig,
     listeners: Vec<Listener>,
@@ -525,6 +620,7 @@ impl Core {
         mut device: LinkDevice,
         events: mpsc::UnboundedSender<StackEvent>,
         kick: Arc<Notify>,
+        socket_count: Arc<SocketCount>,
     ) -> Self {
         let mut iface_config = IfaceConfig::new(HardwareAddress::Ip);
         iface_config.random_seed = config.random_seed;
@@ -561,6 +657,7 @@ impl Core {
             iface,
             device,
             sockets,
+            socket_count: socket_count.clone(),
             clock: Clock::starting_at(0),
             config,
             listeners: Vec::new(),
@@ -656,6 +753,7 @@ impl Core {
 
     fn spawn_listener_socket(&mut self, addr: VirtAddr) -> io::Result<SocketHandle> {
         let handle = self.sockets.add(self.tcp_socket());
+        self.socket_count.add();
         let socket = self.sockets.get_mut::<tcp::Socket>(handle);
         socket
             .listen(IpListenEndpoint {
@@ -709,6 +807,7 @@ impl Core {
         };
         let local = VirtAddr::new(local_ip, local_port);
         let handle = self.sockets.add(self.tcp_socket());
+        self.socket_count.add();
         {
             let socket = self.sockets.get_mut::<tcp::Socket>(handle);
             socket
@@ -778,6 +877,7 @@ impl Core {
             ));
         }
         let handle = self.sockets.add(self.udp_socket());
+        self.socket_count.add();
         {
             let socket = self.sockets.get_mut::<udp::Socket>(handle);
             socket
@@ -910,7 +1010,15 @@ impl Core {
                 .map(|listener| listener.accept_tx.try_send(stream).is_ok());
             if queued != Some(true) {
                 tracing::warn!("inbound connection dropped: accept queue is full");
-                self.conns.remove(&id);
+                // Free the socket too. The connection is already established,
+                // so leaving it in the SocketSet leaks its buffers and holds a
+                // half-open connection from the peer's point of view, since
+                // nothing will ever service it.
+                if let Some(dropped) = self.conns.remove(&id) {
+                    self.sockets.remove(dropped.handle);
+                    self.socket_count.remove();
+                }
+                self.stats.dropped.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             let _ = events.send(StackEvent::Accepted { id, local, remote });
@@ -925,13 +1033,24 @@ impl Core {
             let Some(conn) = self.conns.get_mut(&id) else { continue };
             let mut reset_reason: Option<String> = None;
             let mut closed = false;
+            let mut close_requested = false;
 
             // Control commands.
             loop {
                 match conn.ctl.try_recv() {
+                    // A close request marks the connection for finishing.
+                    // Whether the socket closes on this pass or waits is
+                    // decided after the queues are drained below, because a
+                    // handle dropped while a reply is still in flight must not
+                    // cut the exchange short.
+                    //
+                    // This is the only path by which a dropped handle is noticed
+                    // at all: `Drop` on `TcpStream` sends this, and the reactor
+                    // watches `to_app.is_closed()`, which runs the other way and
+                    // stays open after the application goes.
                     Ok(ConnCmd::Close) => {
                         conn.closing = true;
-                        self.sockets.get_mut::<tcp::Socket>(conn.handle).close();
+                        close_requested = true;
                     }
                     Ok(ConnCmd::Abort) => {
                         self.sockets.get_mut::<tcp::Socket>(conn.handle).abort();
@@ -998,10 +1117,23 @@ impl Core {
                 conn.recv_eof_sent = true;
                 let _ = conn.to_app.try_send(AppEvent::Eof);
             }
+            // A close request closes the socket only once nothing is still owed in
+            // either direction, so a handle dropped mid-exchange does not
+            // discard the reply that is on its way. This is the decision
+            // `TcpStream::drop` cannot make for itself: it does not know whether
+            // the reactor is holding data it still owes.
+            if close_requested && send_queue == 0 && recv_queue == 0 {
+                self.sockets.get_mut::<tcp::Socket>(conn.handle).close();
+            }
+            // A socket in TIME_WAIT is finished for this stack's purposes: it
+            // holds no buffers of anything and smoltcp will never move it again,
+            // because the segment that ends a TIME_WAIT is sent by the socket
+            // that closes last, which is the peer. Keeping it resident means a
+            // short-lived connection leaves a corpse behind, and a workload that
+            // makes many of them grows without bound. `TimeWait` is therefore
+            // treated as closed here even though it is not `Closed`.
             let closed_now = !open
-                || matches!(state, tcp::State::Closed | tcp::State::TimeWait | tcp::State::Closing)
-                    && send_queue == 0
-                    && recv_queue == 0;
+                || matches!(state, tcp::State::Closed | tcp::State::TimeWait | tcp::State::Closing);
             if wrote {
                 // The app had data waiting on a full channel; it can try again.
                 conn.write_waker.wake();
@@ -1017,6 +1149,14 @@ impl Core {
                 } else {
                     let _ = conn.to_app.try_send(AppEvent::Eof);
                 }
+                // Free the smoltcp socket. A SocketSet only grows: `add` reuses
+                // a vacant slot, but nothing reclaims one on its own, so
+                // dropping the Conn without removing the handle leaves the
+                // socket resident with both of its buffers attached for the life
+                // of the process. The reference implementation never called
+                // `remove`, so every connection ever made leaked.
+                self.sockets.remove(conn.handle);
+                self.socket_count.remove();
                 self.emit(StackEvent::Closed { id });
                 self.stats.closed.fetch_add(1, Ordering::Relaxed);
             }
@@ -1093,6 +1233,7 @@ pub struct NetStack {
     link_out: PacketQueue,
     stats: Arc<NetStats>,
     device_stats: Arc<DeviceStats>,
+    socket_count: Arc<SocketCount>,
     shutdown: Arc<Notify>,
     kick: Arc<Notify>,
     events_rx: Option<mpsc::UnboundedReceiver<StackEvent>>,
@@ -1126,7 +1267,9 @@ impl NetStack {
         let device_stats = device.stats();
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let kick = Arc::new(Notify::new());
-        let core = Core::new(config, device, events_tx, kick.clone());
+        let max_poll_interval = config.max_poll_interval;
+        let socket_count = Arc::new(SocketCount::default());
+        let core = Core::new(config, device, events_tx, kick.clone(), socket_count.clone());
         let stats = core.stats.clone();
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let shutdown = Arc::new(Notify::new());
@@ -1134,7 +1277,15 @@ impl NetStack {
         let shutdown_flag = shutdown.clone();
         let run_kick = kick.clone();
         let task = tokio::spawn(async move {
-            run(core, cmd_rx, inbound_wait, shutdown_flag, run_kick).await;
+            run(
+                core,
+                cmd_rx,
+                inbound_wait,
+                shutdown_flag,
+                run_kick,
+                max_poll_interval,
+            )
+            .await;
         });
         Self {
             cmd: cmd_tx,
@@ -1142,6 +1293,7 @@ impl NetStack {
             link_out,
             stats,
             device_stats,
+            socket_count,
             shutdown,
             kick,
             events_rx: Some(events_rx),
@@ -1203,6 +1355,17 @@ impl NetStack {
         self.device_stats.snapshot()
     }
 
+    /// Sockets the reactor holds right now, and the largest number it has held
+    /// at once.
+    ///
+    /// A `SocketSet` reuses a vacant slot on `add` but never reclaims one, so a
+    /// set that is not pruned when a connection closes grows without bound. This
+    /// makes that visible: `live` returns to its resting value after connections
+    /// close if the set is being pruned, and climbs if it is not.
+    pub fn socket_count(&self) -> (u64, u64) {
+        (self.socket_count.live(), self.socket_count.peak())
+    }
+
     /// Take the event stream, at most once.
     pub fn take_events(&mut self) -> Option<mpsc::UnboundedReceiver<StackEvent>> {
         self.events_rx.take()
@@ -1234,16 +1397,20 @@ async fn run(
     inbound_wait: PacketQueue,
     shutdown: Arc<Notify>,
     kick: Arc<Notify>,
+    max_poll_interval: Duration,
 ) {
     loop {
         core.poll_iface();
         core.service();
         core.poll_iface();
 
-        let delay = core
-            .next_delay()
-            .unwrap_or_else(|| Duration::from_millis(100))
-            .min(Duration::from_millis(100));
+        // `next_delay` already clamps to the configured maximum, so clamping
+        // again to a hardcoded 100ms would make `max_poll_interval` a no-op for
+        // every value above 100ms: a stack configured to poll every 5s would
+        // still poll every 100ms. The only floor applied here keeps a
+        // zero-valued configuration from turning the loop into a busy spin.
+        let floor = Duration::from_micros(200).min(max_poll_interval);
+        let delay = core.next_delay().unwrap_or(max_poll_interval).max(floor);
 
         tokio::select! {
             biased;
@@ -1271,12 +1438,21 @@ async fn run(
 
 /// The steps and verdict of a userspace TCP handshake + transfer, run
 /// entirely in-process.
+///
+/// The `kernel_af_inet_*` fields are **not** measurements. A userspace stack has
+/// no way to observe its own syscalls, so the report says which link layer it
+/// ran over rather than asserting a kernel call count it cannot see. The
+/// original set the count to a literal zero and printed "kernel AF_INET
+/// bind/connect used: none", which reads as a syscall trace and is not one: a
+/// direct `AF_INET` connect added anywhere on this path would not change it.
 #[derive(Clone, Debug)]
 pub struct ProofReport {
     pub steps: Vec<String>,
     pub server_state: String,
     pub client_state: String,
-    pub kernel_af_inet_calls: usize,
+    /// The link layer the stack ran over: `"in-process loopback"` or `"a
+    /// tunnel"`. The second would mean packets could reach a kernel socket.
+    pub link_layer: String,
     pub bytes_received: usize,
 }
 
@@ -1296,9 +1472,13 @@ impl ProofReport {
         }
         out.push_str("\n--- verdict ---\n");
         out.push_str(&format!(
-            "kernel AF_INET bind/connect used: {}\n",
-            if self.kernel_af_inet_calls == 0 { "none" } else { "some" }
+            "link layer: {}\n",
+            self.link_layer
         ));
+        out.push_str(
+            "note: this proves the stack ran in-process. It cannot observe its own\n\
+             \x20     syscalls; tests/af_inet_kernel.rs measures the kernel side by socket inode.\n",
+        );
         out.push_str(&format!("server socket final state: {}\n", self.server_state));
         out.push_str(&format!("client socket final state: {}\n", self.client_state));
         if self.passed() {
@@ -1408,7 +1588,7 @@ pub fn loopback_proof() -> ProofReport {
         steps,
         server_state,
         client_state,
-        kernel_af_inet_calls: 0,
+        link_layer: "in-process loopback".to_string(),
         bytes_received: response.len(),
     }
 }
@@ -1458,7 +1638,11 @@ mod tests {
     fn proof_completes() {
         let report = loopback_proof();
         assert!(report.passed(), "{}", report.render());
-        assert_eq!(report.kernel_af_inet_calls, 0);
+        assert!(
+            report.link_layer == "in-process loopback",
+            "the loopback proof must say which link it ran over: {:?}",
+            report.link_layer
+        );
         assert!(report.bytes_received > 20);
         assert!(report.render().contains("PROOF"));
     }

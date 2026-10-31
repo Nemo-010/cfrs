@@ -15,7 +15,7 @@ use cfrs::ingress::{ForwardTarget, Ingress, IngressRule, OriginOptions, Service}
 use cfrs::net::BoxedIo;
 use cfrs::share::{ShareConfig, ShareControl, ShareMode};
 use cfrs::ws::{self, LocalSpec};
-use cfrs::{Protocol, Tunnel};
+use cfrs::{Protocol, Transport, Tunnel};
 use cfrs::vnet::{VirtAddr, VirtualSubnet};
 
 #[derive(Parser, Debug)]
@@ -43,6 +43,8 @@ enum Command {
     Demo(DemoArgs),
     /// Userspace virtual networking (no kernel interfaces).
     Net(NetArgs),
+    /// Cloudflare WARP: anonymous registration and a MASQUE tunnel on 443.
+    Warp(WarpArgs),
 }
 
 #[derive(Args, Clone, Debug)]
@@ -59,6 +61,9 @@ struct TunnelOpts {
     /// Edge transport: auto, quic or http2.
     #[arg(long, default_value = "auto", global = true)]
     protocol: String,
+    /// How to reach the edge: direct (port 7844) or warp (carried on TCP 443).
+    #[arg(long, default_value = "direct", global = true)]
+    transport: String,
     /// Do not fetch the public URL to prove reachability.
     #[arg(long, global = true)]
     no_verify: bool,
@@ -78,6 +83,7 @@ impl TunnelOpts {
         }
         config.ha_connections = self.ha_connections.clamp(1, 8);
         config.protocol = Protocol::parse(&self.protocol)?;
+        config.transport = Transport::parse(&self.transport)?;
         config.verify = !self.no_verify;
         Ok(config)
     }
@@ -232,6 +238,7 @@ async fn main() -> Result<()> {
         }
         Command::Demo(args) => demo(args).await,
         Command::Net(args) => net(args).await,
+        Command::Warp(args) => warp(args).await,
     }
 }
 
@@ -667,6 +674,78 @@ fn _mode(mode: ShareMode) -> ShareMode {
 struct NetArgs {
     #[command(subcommand)]
     command: NetCommand,
+}
+
+#[derive(Args, Debug)]
+struct WarpArgs {
+    #[command(subcommand)]
+    command: WarpCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum WarpCommand {
+    /// Register anonymously and print the device the API created.
+    Register,
+    /// Register, open the tunnel, and print what it carries.
+    Probe {
+        /// A TCP destination to reach through the tunnel, host:port.
+        #[arg(long, value_delimiter = ',')]
+        target: Vec<String>,
+    },
+}
+
+async fn warp(args: WarpArgs) -> Result<()> {
+    use cfrs::warp::WarpClient;
+
+    match args.command {
+        WarpCommand::Register => {
+            let client = WarpClient::register().await?;
+            let device = client.device();
+            println!("device      {}", device.id);
+            println!("account     {}", device.account.id);
+            println!("tunnel      {}", device.tunnel_type);
+            println!("key type    {}", device.key_type);
+            println!("ipv4        {:?}", device.ipv4());
+            println!("ipv6        {:?}", device.ipv6());
+            println!("masque      {:?}", device.masque_endpoint());
+            println!("protocol    {}", device.policy.tunnel_protocol);
+        }
+        WarpCommand::Probe { target } => {
+            let targets = if target.is_empty() {
+                vec![
+                    "1.1.1.1:443".to_string(),
+                    "198.41.192.27:7844".to_string(),
+                ]
+            } else {
+                target
+            };
+            let client = WarpClient::register().await?;
+            println!("device      {}", client.device().id);
+            println!("masque      {:?}", client.device().masque_endpoint());
+            let stack = client.connect().await?;
+            println!("tunnel      up (TCP 443 only)");
+            for spec in targets {
+                let addr: std::net::SocketAddr = spec
+                    .parse()
+                    .with_context(|| format!("parsing {spec} as host:port"))?;
+                let started = std::time::Instant::now();
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(12),
+                    stack.tcp_connect(addr),
+                )
+                .await
+                {
+                    Ok(Ok(conn)) => {
+                        println!("OK          {addr} in {:?}", started.elapsed());
+                        conn.close().await;
+                    }
+                    Ok(Err(err)) => println!("FAIL        {addr}: {err}"),
+                    Err(_) => println!("TIMEOUT     {addr}"),
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Subcommand, Debug)]

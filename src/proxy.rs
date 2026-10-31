@@ -898,3 +898,15 @@ mod tests {
         assert!(!meta.iter().any(|(k, _)| k == "Content-Type"));
     }
 }
+
+// ── re-exports from the outbound CONNECT client ─────────────────────────────
+//
+// `connect.rs` is the HTTP CONNECT *client* (dial out through a proxy); this
+// module is the inbound edge-stream dispatcher. They were the same filename in
+// the two branches, so the client keeps the name `connect` and the upstream
+// call sites (`crate::proxy::connect_tunnel`, …) resolve through these
+// re-exports.
+pub use crate::connect::{
+    base64_encode, base64_encode_pub, connect_tunnel, connect_tunnel_with_auth, strip_scheme,
+    TunnelStream,
+};

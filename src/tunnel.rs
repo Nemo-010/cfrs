@@ -12,13 +12,17 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::config::{parse_credentials_file, parse_token, Config, Credentials, Protocol, ReconnectPolicy};
+use crate::config::{
+    parse_credentials_file, parse_token, Config, Credentials, Protocol, ReconnectPolicy, Transport,
+};
 use crate::ingress::{Ingress, Service};
 use crate::metrics::Metrics;
 use crate::proxy;
 use crate::service::ServiceRuntime;
 use crate::share::ShareControl;
 use crate::util::validate_quick_hostname;
+use crate::warp::edge::EdgeRelay;
+use crate::warp::WarpClient;
 
 pub const CLIENT_VERSION: &str = concat!("cfrs/", env!("CARGO_PKG_VERSION"));
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -139,6 +143,7 @@ impl Tunnel {
             user_agent,
             credentials,
             protocol,
+            transport,
             ha_connections,
             reconnect,
             ingress,
@@ -157,9 +162,54 @@ impl Tunnel {
         let runtime = Arc::new(ServiceRuntime::build(&ingress, metrics.clone())?);
         let ingress = Arc::new(ingress);
 
+        // Where the QUIC handshake goes. Direct mode dials the edge on 7844;
+        // WARP mode dials a local relay whose datagrams are carried inside a
+        // MASQUE tunnel on TCP 443, so 7844 is never opened by this host.
+        let (edges, warp_keepalive) = match transport {
+            Transport::Direct => (
+                edge::discover(IpVersionFilter::Auto)
+                    .await
+                    .context("edge discovery")?,
+                None,
+            ),
+            Transport::Warp => {
+                let discovered = edge::discover(IpVersionFilter::Auto)
+                    .await
+                    .context("edge discovery")?;
+                let Some(first) = discovered.first() else {
+                    bail!("edge discovery returned no addresses");
+                };
+                let client = WarpClient::register()
+                    .await
+                    .context("registering with WARP")?;
+                let stack = client
+                    .connect()
+                    .await
+                    .context("opening the WARP MASQUE tunnel on 443")?;
+                let relay = crate::warp::edge::relay_over_warp(&stack, first.socket())
+                    .await
+                    .context("bridging the edge through WARP")?;
+                info!(
+                    edge = %first.socket(),
+                    relay = %relay.local,
+                    "the tunnel edge will be reached through WARP on 443"
+                );
+                let proxied = edge::EdgeAddr {
+                    ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    port: relay.local.port(),
+                    version: edge::EdgeIpVersion::V4,
+                };
+                (vec![proxied], Some((stack, relay)))
+            }
+        };
+        if edges.is_empty() {
+            bail!("edge discovery returned no addresses");
+        }
+        let edges = Arc::new(edges);
+
         let endpoint = quic_dial::build_endpoint()?;
         let (conn, control, location) =
-            connect_once(&endpoint, &auth, tunnel_id, 0, false).await?;
+            connect_once(&endpoint, &auth, tunnel_id, 0, false, &edges).await?;
         metrics.connection_opened();
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -179,6 +229,7 @@ impl Tunnel {
             shutdown_rx.clone(),
             reconnect.clone(),
             0,
+            edges.clone(),
         )));
 
         // Remaining HA legs register in the background.
@@ -190,8 +241,9 @@ impl Tunnel {
             let metrics = metrics.clone();
             let shutdown_rx = shutdown_rx.clone();
             let reconnect = reconnect.clone();
+            let edges = edges.clone();
             tasks.push(tokio::spawn(async move {
-                match connect_once(&endpoint, &auth, tunnel_id, index, false).await {
+                match connect_once(&endpoint, &auth, tunnel_id, index, false, &edges).await {
                     Ok((conn, control, location)) => {
                         metrics.connection_opened();
                         info!(conn_index = index, %location, "HA leg registered");
@@ -207,6 +259,7 @@ impl Tunnel {
                             shutdown_rx,
                             reconnect,
                             index,
+                            edges,
                         )
                         .await;
                     }
@@ -227,6 +280,7 @@ impl Tunnel {
             shutdown: shutdown_tx,
             tasks,
             verify,
+            _warp: warp_keepalive,
         })
     }
 }
@@ -298,12 +352,10 @@ async fn connect_once(
     tunnel_id: Uuid,
     conn_index: u8,
     replace_existing: bool,
+    edges: &[edge::EdgeAddr],
 ) -> Result<(quinn::Connection, rpc::ControlSession, String)> {
-    let edges = edge::discover(IpVersionFilter::Auto)
-        .await
-        .context("edge discovery")?;
     if edges.is_empty() {
-        bail!("edge discovery returned no addresses");
+        bail!("no edge addresses to dial");
     }
     let candidates = edges.len().min(5);
     let conn = quic_dial::dial_any(endpoint, &edges[..candidates])
@@ -335,6 +387,7 @@ async fn reactor(
     mut shutdown: watch::Receiver<bool>,
     policy: ReconnectPolicy,
     conn_index: u8,
+    edges: Arc<Vec<edge::EdgeAddr>>,
 ) {
     loop {
         if *shutdown.borrow() {
@@ -385,7 +438,7 @@ async fn reactor(
                 }
                 _ = tokio::time::sleep(delay) => {}
             }
-            match connect_once(&endpoint, &auth, tunnel_id, conn_index, true).await {
+            match connect_once(&endpoint, &auth, tunnel_id, conn_index, true, &edges).await {
                 Ok((new_conn, new_control, location)) => {
                     info!(conn_index, attempt, %location, "reconnected");
                     metrics.reconnect();
@@ -414,6 +467,9 @@ pub struct TunnelHandle {
     shutdown: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
     verify: bool,
+    /// Kept alive for the tunnel's lifetime: dropping either tears down the
+    /// WARP session the edge connection is riding on.
+    _warp: Option<(crate::warp::WarpStack, EdgeRelay)>,
 }
 
 impl TunnelHandle {

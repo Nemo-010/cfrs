@@ -78,6 +78,13 @@ pub fn resolve_target(request: &socks::ProxyRequest, resolver: &Resolver, defaul
 ///
 /// The protocol is detected from the first byte (SOCKS5 begins with `0x05`),
 /// so one listener serves both SOCKS5 and HTTP `CONNECT` clients.
+pub use crate::vnet::stack::TcpStream;
+
+/// How long one proxied client connection may take, end to end. A client that
+/// opens a connection to the front door and then says nothing holds a task and
+/// an origin socket until this expires.
+const CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 pub async fn handle_connection<S>(stream: S, net: Arc<NetStack>, resolver: Resolver, default_port: u16)
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -106,8 +113,17 @@ where
             return;
         }
     };
+    // `net.connect` returns as soon as the socket exists and the SYN is queued,
+    // which is not the same as the connection being established. The client has
+    // already sent its request and is waiting, so if nothing is listening it
+    // waits for data that will never arrive. Refusing instead means the client
+    // gets a SOCKS5 error or a 502, which it can act on.
     match net.connect(target).await {
         Ok(mut remote) => {
+            if let Err(message) = wait_established(&mut remote).await {
+                fail(&mut reader, is_socks, &message).await;
+                return;
+            }
             let reply = if is_socks {
                 socks::socks5_reply(&mut reader, 0x00, None).await
             } else {
@@ -116,9 +132,44 @@ where
             if reply.is_err() {
                 return;
             }
-            let _ = tokio::io::copy_bidirectional(&mut reader, &mut remote).await;
+            // Bound the whole exchange. Without this a client that opens a
+            // connection and then stops reading holds a task and both sockets
+            // indefinitely, and there is nothing else in the process that would
+            // notice.
+            let _ = tokio::time::timeout(
+                CLIENT_TIMEOUT,
+                tokio::io::copy_bidirectional(&mut reader, &mut remote),
+            )
+            .await;
         }
         Err(err) => fail(&mut reader, is_socks, &err.to_string()).await,
+    }
+}
+
+/// Wait for the virtual connection to be established, or report why it failed.
+///
+/// [`crate::vnet::stack::NetStack::connect`] returns once the socket is created,
+/// which for a nonexistent listener still succeeds at the API level. A caller
+/// that must choose between "refuse" and "accept" needs the handshake's outcome.
+async fn wait_established(stream: &mut TcpStream) -> Result<(), String> {
+    use tokio::io::AsyncReadExt;
+    // The stack signals a reset or a refusal through the read side, and a
+    // pending connection by not completing one. A zero-length read resolves as
+    // soon as the reactor has made the connection usable, and returns an error
+    // when the connection was reset.
+    loop {
+        let mut probe = [0u8; 0];
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            stream.read(&mut probe),
+        )
+        .await
+        {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(err)) => return Err(err.to_string()),
+            // Still pending: give the reactor more time.
+            Err(_) => continue,
+        }
     }
 }
 

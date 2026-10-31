@@ -1,6 +1,7 @@
 //! A userspace virtual network for sealed sandboxes.
 //!
-//! This module implements the design in `VIRTUAL-NETWORK.md`: a private
+//! This module implements the design in the *Userspace virtual networking*
+//! section of `README.md`: a private
 //! IPv4/IPv6 address space that exists without a network namespace, without a
 //! TUN/TAP device, and without `CAP_NET_ADMIN`. Two layers compose:
 //!

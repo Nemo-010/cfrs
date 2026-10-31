@@ -163,6 +163,45 @@ static void ensure_init(void) {
     pthread_once(&cfg_once, cfg_init);
 }
 
+/* Every interposed function must reach ensure_init before it dereferences an
+ * r_* pointer or reads cfg, because both start out zeroed.
+
+ * This is not a formality. close(2), dup(2), dup2(2), getpeername(2) and
+ * getsockname(2) are called by programs that never open a socket at all: any
+ * program that writes a file closes a descriptor first. Without ensure_init in
+ * those functions, r_close is NULL at that point and the process dies with
+ * SIGSEGV before it does anything useful. A shim that breaks the majority of
+ * programs defeats its own purpose, so the check belongs in all of them. */
+
+/* Copy a logical address into the caller's buffer the way Linux does.
+
+   The Linux contract for getsockname/getpeername/getsockopt is: write at most
+   *len bytes, then report the address's true length in *len, and succeed. A
+   caller that wants the length asks with a zero-length buffer; a caller with a
+   deliberately small buffer gets a truncated address, not an error. The
+   reference implementation returned EINVAL for a short buffer and wrote a
+   whole sockaddr_storage regardless, which both disagreed with the kernel and
+   smashed the caller's stack when the buffer was smaller than 128 bytes.
+
+   Returns 0 on success, -1 with errno set for the caller-error cases. */
+static int copy_sockaddr(struct sockaddr *sa, socklen_t *slen,
+                         const struct sockaddr_storage *addr, socklen_t addr_len) {
+    if (!slen) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!sa) {
+        /* Linux allows a null buffer purely to query the length. */
+        *slen = addr_len;
+        return 0;
+    }
+    socklen_t capacity = *slen;
+    socklen_t copy = addr_len < capacity ? addr_len : capacity;
+    if (copy) memcpy(sa, addr, copy);
+    *slen = addr_len;
+    return 0;
+}
+
 /* ── fd state table ───────────────────────────────────────────────────────── */
 
 struct virt_fd {
@@ -526,9 +565,13 @@ int connect(int fd, const struct sockaddr *sa, socklen_t len) {
     return rc;
 }
 
-int listen(int fd, int backlog) { return r_listen(fd, backlog); }
+int listen(int fd, int backlog) {
+    ensure_init();
+    return r_listen(fd, backlog);
+}
 
-static int finish_accept(int listener, int client, struct sockaddr *sa, socklen_t *len) {
+static int finish_accept(int listener, int client, struct sockaddr *sa, socklen_t *len,
+                         socklen_t capacity) {
     if (client < 0) return client;
     if (fd_is_virtual(listener)) {
         pthread_mutex_lock(&fd_lock);
@@ -544,15 +587,24 @@ static int finish_accept(int listener, int client, struct sockaddr *sa, socklen_
         fd_mark(client, family ? family : AF_INET, 0);
         if (local_len) fd_record_local(client, (struct sockaddr *)&local, local_len);
         /* Recover the logical peer if the client bound a cfrsnet name. */
-        if (sa && len && *len > 0) {
+        if (sa && len && capacity > 0) {
+            /* Read the kernel's answer through a local buffer: the caller's
+               buffer may be smaller than the abstract name, and the kernel has
+               already told us how much it wanted to write. */
+            struct sockaddr_storage raw;
+            socklen_t raw_len = sizeof raw;
+            socklen_t got = *len;
+            memcpy(&raw, sa, got < sizeof raw ? got : sizeof raw);
+            if (got > sizeof raw) got = sizeof raw;
+            raw_len = got;
             struct sockaddr_storage peer;
             socklen_t peer_len = 0;
-            if (peer_from_unix(sa, *len, &peer, &peer_len) == 0) {
+            if (peer_from_unix((struct sockaddr *)&raw, raw_len, &peer, &peer_len) == 0) {
                 fd_record_peer(client, (struct sockaddr *)&peer, peer_len);
-                /* Never write past the caller's buffer: copy what fits and
-                 * report the true length, as accept(2) does. */
-                socklen_t capacity = *len;
-                memcpy(sa, &peer, peer_len < capacity ? peer_len : capacity);
+                /* Truncate to the caller's buffer and report the true length,
+                   which is what accept(2) does on Linux. */
+                socklen_t copy = peer_len < capacity ? peer_len : capacity;
+                memcpy(sa, &peer, copy);
                 *len = peer_len;
             } else {
                 *len = 0;
@@ -563,53 +615,63 @@ static int finish_accept(int listener, int client, struct sockaddr *sa, socklen_
 }
 
 int accept(int fd, struct sockaddr *sa, socklen_t *len) {
+    ensure_init();
+    /* Save the caller's capacity before the real accept overwrites *len with
+       the kernel's own answer. Linux accepts an address longer than the
+       caller's buffer by truncating and reporting the true length, so the
+       shim must do the same; clamping against the kernel's length instead
+       would be clamping against a number the caller never chose. */
+    socklen_t capacity = len ? *len : 0;
     int client = r_accept(fd, sa, len);
-    return finish_accept(fd, client, sa, len);
+    return finish_accept(fd, client, sa, len, capacity);
 }
 
 int accept4(int fd, struct sockaddr *sa, socklen_t *len, int flags) {
+    ensure_init();
+    socklen_t capacity = len ? *len : 0;
     int client = r_accept4(fd, sa, len, flags);
-    return finish_accept(fd, client, sa, len);
+    return finish_accept(fd, client, sa, len, capacity);
+}
+
+/* The address an un-bound or unconnected socket reports.
+
+   getsockname on a socket that has not been bound answers with the wildcard
+   address of its own family and port 0, which is what an AF_INET socket says.
+   getpeername on a socket that is not connected answers ENOTCONN, not a
+   wildcard: Linux has nothing to report there, and inventing an address makes
+   a program believe it has a peer it does not have. */
+static socklen_t wildcard_addr(int family, struct sockaddr_storage *out) {
+    memset(out, 0, sizeof *out);
+    if (family == AF_INET6) {
+        struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)out;
+        s6->sin6_family = AF_INET6;
+        return sizeof *s6;
+    }
+    struct sockaddr_in *s4 = (struct sockaddr_in *)out;
+    s4->sin_family = AF_INET;
+    return sizeof *s4;
 }
 
 int getpeername(int fd, struct sockaddr *sa, socklen_t *len) {
+    ensure_init();
     if (!fd_is_virtual(fd)) return r_getpeername(fd, sa, len);
     pthread_mutex_lock(&fd_lock);
     struct sockaddr_storage peer;
     socklen_t peer_len = 0;
-    int family = 0;
     if ((size_t)fd < fd_table_len) {
         peer = fd_table[fd].peer;
         peer_len = fd_table[fd].peer_len;
-        family = fd_table[fd].family;
     }
     pthread_mutex_unlock(&fd_lock);
     if (peer_len == 0) {
-        /* Unconnected or a peer that never bound: report a wildcard of the
-         * socket's own family, which is what an unbound AF_INET socket says. */
-        *len = 0;
-        memset(sa, 0, sizeof(struct sockaddr_storage));
-        if (family == AF_INET6) {
-            struct sockaddr_in6 *s = (struct sockaddr_in6 *)sa;
-            s->sin6_family = AF_INET6;
-            *len = sizeof *s;
-        } else {
-            struct sockaddr_in *s = (struct sockaddr_in *)sa;
-            s->sin_family = AF_INET;
-            *len = sizeof *s;
-        }
-        return 0;
-    }
-    if (*len < peer_len) {
-        errno = EINVAL;
+        errno = ENOTCONN;
         return -1;
     }
-    memcpy(sa, &peer, peer_len);
-    *len = peer_len;
-    return 0;
+    return copy_sockaddr(sa, len, &peer, peer_len);
 }
 
 int getsockname(int fd, struct sockaddr *sa, socklen_t *len) {
+    ensure_init();
     if (!fd_is_virtual(fd)) return r_getsockname(fd, sa, len);
     pthread_mutex_lock(&fd_lock);
     struct sockaddr_storage local;
@@ -622,58 +684,113 @@ int getsockname(int fd, struct sockaddr *sa, socklen_t *len) {
     }
     pthread_mutex_unlock(&fd_lock);
     if (local_len == 0) {
-        memset(sa, 0, sizeof(struct sockaddr_storage));
-        if (family == AF_INET6) {
-            struct sockaddr_in6 *s = (struct sockaddr_in6 *)sa;
-            s->sin6_family = AF_INET6;
-            *len = sizeof *s;
-        } else {
-            struct sockaddr_in *s = (struct sockaddr_in *)sa;
-            s->sin_family = AF_INET;
-            *len = sizeof *s;
-        }
-        return 0;
+        struct sockaddr_storage any;
+        socklen_t any_len = wildcard_addr(family ? family : AF_INET, &any);
+        return copy_sockaddr(sa, len, &any, any_len);
     }
-    if (*len < local_len) {
-        errno = EINVAL;
-        return -1;
-    }
-    memcpy(sa, &local, local_len);
-    *len = local_len;
-    return 0;
+    return copy_sockaddr(sa, len, &local, local_len);
 }
 
 int close(int fd) {
+    ensure_init();
     int rc = r_close(fd);
     if (rc == 0) fd_clear(fd);
     return rc;
 }
 
+/* dup(2) and friends must resolve the real symbol and read cfg.max_fds before
+   fd_copy runs, or a program that duplicates a descriptor before its first
+   socket call reads an unparsed configuration and silently loses virtual
+   status on the copy. */
 int dup(int oldfd) {
+    ensure_init();
     int fd = r_dup(oldfd);
     if (fd >= 0) fd_copy(oldfd, fd);
     return fd;
 }
 
 int dup2(int oldfd, int newfd) {
+    ensure_init();
     int fd = r_dup2(oldfd, newfd);
-    if (fd >= 0) fd_copy(oldfd, fd);
+    if (fd >= 0) fd_copy(oldfd, newfd);
     return fd;
 }
 
 int dup3(int oldfd, int newfd, int flags) {
+    ensure_init();
     int fd = r_dup3(oldfd, newfd, flags);
-    if (fd >= 0) fd_copy(oldfd, fd);
+    if (fd >= 0) fd_copy(oldfd, newfd);
     return fd;
 }
 
+/* fcntl(2) is variadic and its commands take two different kinds of third
+   argument: an int for the flag setters, a pointer for the out-parameters.
+   Reading a va_arg of the wrong type is undefined behaviour, and reading one at
+   all for a command called with two arguments is undefined behaviour too. So
+   each group reads its own type, and the argument-free group reads nothing.
+
+   The first version of this shim read a single `void *` unconditionally. On
+   x86-64 SysV that happens to work, because the third argument register holds
+   whatever the caller left there and the kernel ignores it for F_GETFD, but it
+   is UB at every optimisation level and would break on a target whose variadic
+   save area is only filled for arguments actually passed. */
 int fcntl(int fd, int cmd, ...) {
     ensure_init();
     va_list ap;
     va_start(ap, cmd);
-    void *arg = va_arg(ap, void *);
-    va_end(ap);
-    int rc = r_fcntl(fd, cmd, arg);
+
+    int rc;
+    switch (cmd) {
+    /* No third argument. */
+    case F_GETFD:
+    case F_GETFL:
+    case F_GETOWN:
+    case F_GETSIG:
+    case F_GETLEASE:
+        rc = r_fcntl(fd, cmd);
+        va_end(ap);
+        return rc;
+
+    /* Third argument is an int. */
+    case F_SETFD:
+    case F_SETFL:
+    case F_SETOWN:
+    case F_SETSIG:
+    case F_SETLEASE:
+    case F_SETPIPE_SZ:
+    case F_NOTIFY:
+    case F_DUPFD:
+    case F_DUPFD_CLOEXEC: {
+        int arg = va_arg(ap, int);
+        va_end(ap);
+        rc = r_fcntl(fd, cmd, arg);
+        break;
+    }
+
+    /* Third argument is a pointer the kernel writes through. */
+    case F_GETPIPE_SZ:
+    case F_GET_SEALS:
+    case F_GET_RW_HINT:
+    case F_SET_RW_HINT:
+    case F_ADD_SEALS: {
+        void *arg = va_arg(ap, void *);
+        va_end(ap);
+        rc = r_fcntl(fd, cmd, arg);
+        break;
+    }
+
+    default: {
+        /* A command this shim does not know. Forward it as an int, which is
+           the shape of every remaining Linux command; a command with a
+           different shape would be reported by the kernel rather than ignored,
+           because EBADF/EINVAL still come back. */
+        int arg = va_arg(ap, int);
+        va_end(ap);
+        rc = r_fcntl(fd, cmd, arg);
+        break;
+    }
+    }
+
     if (rc >= 0 && (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC)) fd_copy(fd, rc);
     return rc;
 }

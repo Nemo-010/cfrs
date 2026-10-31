@@ -107,6 +107,16 @@ impl FrameDecoder {
                 }
                 let len = u16::from_be_bytes([self.buffer[0], self.buffer[1]]) as usize;
                 if len == 0 {
+                    // A zero-length frame cannot be told from the start of the
+                    // next one by the length alone, so the decoder has no way to
+                    // resynchronise: every later push re-reads the same two
+                    // bytes and fails identically. Returning the error with
+                    // those bytes still at the head wedges the decoder for the
+                    // life of the connection and grows the buffer without
+                    // bound. Report it and stop, so the caller can drop the
+                    // connection deliberately rather than being stuck.
+                    self.expected = None;
+                    self.frame.clear();
                     return Err("zero-length frame".into());
                 }
                 self.expected = Some(len);

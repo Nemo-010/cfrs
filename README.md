@@ -17,6 +17,8 @@ adds a full service layer on top:
 | `cfrs ports` | List local listening TCP ports (Linux `/proc/net/tcp{,6}`). |
 | `cfrs qr` | Render a URL as a terminal QR code. |
 | `cfrs demo` | Self-contained proof: a built-in origin, a quick tunnel, then a fetch of the public URL. |
+| `cfrs net` | Userspace virtual networking: an `LD_PRELOAD` socket shim and a `smoltcp` stack, so a host with no `AF_INET` still has addresses. |
+| `cfrs warp` | Anonymous Cloudflare WARP registration and a MASQUE tunnel, so the edge is reachable on TCP 443 alone. |
 
 The whole thing is also a library; see [Library](#library).
 
@@ -171,6 +173,9 @@ cfrs tunnel --url http://127.0.0.1:3000 --forward tcp://127.0.0.1:5432
 - **QUIC over UDP/7844.** Where outbound TCP/7844 is blocked, the UDP path still
   works, and the edge is discovered by DNS SRV + DNS-over-TLS rather than a
   hard-coded address.
+- **TCP 443 as the only way out.** Where 7844 is filtered outright, `--transport
+  warp` carries the edge connection inside a MASQUE tunnel on 443. See
+  *Reaching the edge through WARP* below.
 - **No `cloudflared`.** The protocol is implemented in-process, so the host needs
   no Go binary and no extra privileges.
 - **Arbitrary streams over the HTTP tunnel.** Where a host can only be reached
@@ -238,6 +243,33 @@ host, and `cfrs net addresses` prints the address plan and its abstract names.
 The library half adds `vnet::dns` (a virtual resolver), `vnet::policy`
 (connect-time ACLs), `vnet::record` (pcap capture and deterministic replay) and
 `vnet::proxy`.
+
+## Reaching the edge through WARP
+
+The edge answers on port 7844 and nowhere else, so a host that filters that port
+cannot tunnel at all — even when TCP 443 is wide open. `--transport warp` closes
+that gap: `cfrs` registers anonymously with Cloudflare WARP, opens a MASQUE
+(`CONNECT-IP`) tunnel over HTTP/2 on **TCP 443**, and dials the edge's QUIC
+connection *inside* it. The host never opens a connection to port 7844 at all.
+
+```sh
+cfrs warp register                        # the device WARP created, and its endpoint
+cfrs warp probe                           # TCP through the tunnel: 1.1.1.1:443 and
+                                          # an edge on 7844, by default
+cfrs tunnel --hello-world --transport warp
+```
+
+Nothing external is involved: no `warp-cli`, no `wgcf`, no `cloudflared`. The
+registration is two HTTP calls, the session is one HTTP/2 `CONNECT`, and the
+`smoltcp` stack above it (`cfrs::warp`) carries the packets.
+
+Measured on a host with open egress, so it proves the implementation rather than
+the sandbox: `cfrs tunnel --hello-world --transport warp` provisions a quick
+tunnel, registers with the edge through the MASQUE session, and fetches its own
+public URL for HTTP 200, while `cfrs warp probe` reaches `1.1.1.1:443` and
+`198.41.192.27:7844` in about 100 ms each. The library form is
+`WarpClient::register()` followed by `connect()`, which returns a stack whose
+`tcp_connect` reaches what the host itself cannot.
 
 ## How it works
 

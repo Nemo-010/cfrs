@@ -192,12 +192,20 @@ impl ControlMessage {
             }
             Self::Error { id, code, message } => {
                 // id(4) + code(1) + len(2) = 7 bytes of overhead.
-                out.extend_from_slice(&id.to_be_bytes());
-                out.push(*code as u8);
-                let text = message.as_bytes();
-                let take = text.len().min(MAX_CONTROL_PAYLOAD.saturating_sub(7));
-                out.extend_from_slice(&(take as u16).to_be_bytes());
-                out.extend_from_slice(&text[..take]);
+                // id(4) + code(1) + msg_len(2) + message. The message length is a
+                // separate field inside the payload, and the decoder requires
+                // it, so it has to be written even when the message is clipped.
+                // The clip is on a character boundary: the reference
+                // implementation clipped at a raw byte budget, which panics when
+                // the budget lands inside a multi-byte character and yields
+                // invalid UTF-8 when it does not.
+                let body = floor_char_boundary(message, u16::MAX as usize - 7);
+                let mut payload = Vec::with_capacity(7 + body);
+                payload.extend_from_slice(&id.to_be_bytes());
+                payload.push(*code as u8);
+                payload.extend_from_slice(&(body as u16).to_be_bytes());
+                payload.extend_from_slice(message.as_bytes().get(..body).unwrap_or(&[]));
+                out.extend_from_slice(&payload);
             }
             Self::Ping { token } | Self::Pong { token } => {
                 out.extend_from_slice(&token.to_be_bytes());
@@ -372,9 +380,43 @@ fn decode_payload(op: ControlOp, payload: &[u8]) -> Result<ControlMessage> {
 }
 
 /// An incremental control-protocol decoder over a byte stream.
+/// Frames decoded from a single `push` before the resynchronisation loop gives
+/// up, so a peer streaming rubbish cannot spin a caller forever.
+const MAX_FRAMES_PER_PUSH: usize = 1024;
+
+/// The largest index at or below `limit` that is a UTF-8 character boundary.
+///
+/// A `&str` may only be sliced at a character boundary, so every byte-budget
+/// truncation of a `&str` has to go through this rather than through `min`. A
+/// budget that lands mid-character and is then sliced panics.
+fn floor_char_boundary(text: &str, limit: usize) -> usize {
+    if limit >= text.len() {
+        return text.len();
+    }
+    let mut cut = limit;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    cut
+}
+
+/// The total byte length of the frame at the head of `buf`, if the header
+/// names one.
+///
+/// `None` when there are not yet three bytes to read a header, which means the
+/// frame is merely incomplete and must be kept rather than dropped.
+fn frame_length(buf: &[u8]) -> Option<usize> {
+    if buf.len() < 3 {
+        return None;
+    }
+    let len = u16::from_be_bytes([buf[1], buf[2]]) as usize;
+    Some(3 + len)
+}
+
 #[derive(Debug, Default)]
 pub struct ControlDecoder {
     buffer: Vec<u8>,
+    dropped_frames: u32,
 }
 
 impl ControlDecoder {
@@ -382,14 +424,64 @@ impl ControlDecoder {
         Self::default()
     }
 
+    /// Feed more bytes and take every complete message out of the buffer.
+    ///
+    /// A frame with an unknown opcode is dropped rather than wedging the stream.
+    /// The reference implementation returned the error with the offending byte
+    /// still at the head of the buffer, so every later `push` re-read the same
+    /// byte, failed identically, and never drained: the connection was
+    /// permanently desynchronised and the buffer grew with everything the peer
+    /// kept sending. Dropping the bad frame keeps the decoder usable, and
+    /// reporting the drop lets the caller log it.
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<ControlMessage>> {
         self.buffer.extend_from_slice(bytes);
         let mut messages = Vec::new();
-        while let Some((message, used)) = ControlMessage::decode(&self.buffer)? {
-            self.buffer.drain(..used);
-            messages.push(message);
+        loop {
+            match ControlMessage::decode(&self.buffer) {
+                Ok(Some((message, used))) => {
+                    self.buffer.drain(..used);
+                    messages.push(message);
+                }
+                // A partial frame at the head: wait for more bytes.
+                Ok(None) => break,
+                Err(e) => {
+                    // Resynchronise on the frame boundary the length prefix
+                    // describes, not on a single byte.
+                    //
+                    // The header is op(1) | len(2), so once the opcode is known
+                    // the frame's total length is known even when the payload
+                    // will not decode. Dropping that whole frame is what keeps a
+                    // good frame behind the rubbish decodable: dropping one byte
+                    // at a time would walk into the middle of the next frame,
+                    // reinterpret its payload bytes as an opcode, and consume
+                    // it as rubbish.
+                    let skip = match frame_length(&self.buffer) {
+                        Some(len) => len,
+                        // Fewer than three bytes and still undecodable, which
+                        // cannot happen for a well-formed header but can for a
+                        // peer sending noise. Wait for more bytes.
+                        None => break,
+                    };
+                    tracing::warn!(bytes = skip, error = %e, "control frame dropped");
+                    self.dropped_frames += 1;
+                    self.buffer.drain(..skip.min(self.buffer.len()));
+                    // Bound the work one push can do, so a peer streaming
+                    // rubbish cannot spin this loop for the length of the
+                    // stream.
+                    if messages.len() + self.dropped_frames as usize >= MAX_FRAMES_PER_PUSH {
+                        break;
+                    }
+                }
+            }
         }
         Ok(messages)
+    }
+
+    /// How many frames have been discarded as undecodable since this decoder
+    /// was created. A non-zero value means the peer is speaking something other
+    /// than this protocol.
+    pub fn dropped(&self) -> u32 {
+        self.dropped_frames
     }
 
     pub fn pending(&self) -> usize {

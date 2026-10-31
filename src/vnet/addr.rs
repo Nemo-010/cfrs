@@ -350,6 +350,24 @@ pub fn fnv1a64(bytes: &[u8]) -> u64 {
 /// Loopback is the common case for dev servers and MCP servers. Returning the
 /// mapped endpoint unchanged when the port is the well-known gateway port lets
 /// a caller decide policy; the shim calls this for `127.0.0.1` and `localhost`.
+/// A listener address inside the virtual subnet, for tests and for
+/// configuration that names a port explicitly.
+///
+/// [`map_loopback`] folds loopback into the subnet and cannot fail, which is
+/// right for the shim's loose mode but wrong where a caller asked for a
+/// specific address: the subnet is `10.66.0.0/24`, so `127.0.0.1` is outside it,
+/// and a helper that quietly accepted it would report a bound listener that the
+/// stack never has. This refuses instead.
+pub fn subnet_addr(subnet: &VirtualSubnet, host: &str, port: u16) -> Result<VirtAddr> {
+    let ip: IpAddr = host
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{host:?} is not an IP address"))?;
+    if !subnet.contains(&ip) {
+        bail!("{ip} is outside the virtual subnet {}/{}", subnet.v4, subnet.v4_prefix);
+    }
+    Ok(VirtAddr { ip, port })
+}
+
 pub fn map_loopback(addr: SocketAddr, subnet: &VirtualSubnet) -> VirtAddr {
     match addr {
         SocketAddr::V4(v4) if v4.ip().is_loopback() => {

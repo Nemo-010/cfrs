@@ -112,6 +112,27 @@ impl Protocol {
     }
 }
 
+/// How the connection to the tunnel edge is carried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Transport {
+    /// Dial the edge directly on port 7844. Fast, and what `cloudflared` does.
+    #[default]
+    Direct,
+    /// Carry the edge connection inside a WARP MASQUE tunnel on TCP 443, so the
+    /// host never has to reach port 7844 at all.
+    Warp,
+}
+
+impl Transport {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "direct" => Ok(Transport::Direct),
+            "warp" | "masque" | "warp+masque" => Ok(Transport::Warp),
+            other => bail!("unknown transport {other:?}; expected direct or warp"),
+        }
+    }
+}
+
 /// Reconnect behaviour when the edge drops a connection.
 #[derive(Clone, Debug)]
 pub struct ReconnectPolicy {
@@ -145,6 +166,7 @@ pub struct Config {
     pub user_agent: String,
     pub credentials: Credentials,
     pub protocol: Protocol,
+    pub transport: Transport,
     pub ha_connections: u8,
     pub reconnect: ReconnectPolicy,
     pub ingress: Ingress,
@@ -158,6 +180,7 @@ impl Default for Config {
             user_agent: format!("cfrs/{}", env!("CARGO_PKG_VERSION")),
             credentials: Credentials::Quick,
             protocol: Protocol::Auto,
+            transport: Transport::Direct,
             ha_connections: 2,
             reconnect: ReconnectPolicy::default(),
             ingress: Ingress::default(),

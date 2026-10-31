@@ -21,27 +21,36 @@
 //! It speaks the Cloudflare quick-tunnel protocol natively (QUIC + Cap'n Proto
 //! RPC, no `cloudflared` subprocess) and also accepts named-tunnel tokens.
 
+pub mod cloudflare;
 pub mod config;
+pub mod connect;
+pub mod feature;
 pub mod gate;
 pub mod ingress;
 pub mod metrics;
 pub mod net;
+pub mod origin;
 pub mod ports;
 pub mod proxy;
 pub mod qr;
+pub mod quicktunnel;
+pub mod relay;
 pub mod service;
 pub mod share;
+pub mod transport;
 pub mod tunnel;
 pub mod util;
 pub mod vnet;
+pub mod warp;
 pub mod ws;
 
-pub use config::{Config, Credentials, Protocol, ReconnectPolicy};
+pub use config::{Config, Credentials, Protocol, ReconnectPolicy, Transport};
 pub use ingress::{ForwardTarget, Ingress, IngressRule, OriginOptions, Service};
 pub use metrics::{Metrics, MetricsSnapshot};
 pub use share::{ShareApp, ShareConfig, ShareControl, ShareMode};
 pub use tunnel::{Tunnel, TunnelBuilder, TunnelHandle};
 pub use vnet::{NetStack, VirtAddr, VirtualSubnet};
+pub use warp::{Identity, MasqueSession, StackConfig, WarpClient, WarpStack};
 pub use ws::LocalSpec;
 
 /// Install the rustls crypto provider. Called automatically by
