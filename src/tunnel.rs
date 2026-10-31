@@ -26,6 +26,8 @@ use crate::warp::WarpClient;
 
 pub const CLIENT_VERSION: &str = concat!("cfrs/", env!("CARGO_PKG_VERSION"));
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a direct attempt gets before `auto` falls back to WARP.
+const DIRECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(8);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// Fluent builder for a [`Tunnel`].
@@ -88,6 +90,13 @@ impl TunnelBuilder {
         self
     }
 
+    /// How the edge connection is carried: `auto` (try direct, then fall back),
+    /// `direct` on port 7844, or `warp` inside a MASQUE tunnel on TCP 443.
+    pub fn transport(mut self, transport: Transport) -> Self {
+        self.config.transport = transport;
+        self
+    }
+
     pub fn reconnect(mut self, policy: ReconnectPolicy) -> Self {
         self.config.reconnect = policy;
         self
@@ -144,6 +153,7 @@ impl Tunnel {
             credentials,
             protocol,
             transport,
+            warp_identity,
             ha_connections,
             reconnect,
             ingress,
@@ -164,52 +174,68 @@ impl Tunnel {
 
         // Where the QUIC handshake goes. Direct mode dials the edge on 7844;
         // WARP mode dials a local relay whose datagrams are carried inside a
-        // MASQUE tunnel on TCP 443, so 7844 is never opened by this host.
-        let (edges, warp_keepalive) = match transport {
-            Transport::Direct => (
-                edge::discover(IpVersionFilter::Auto)
-                    .await
-                    .context("edge discovery")?,
-                None,
-            ),
-            Transport::Warp => {
-                let discovered = edge::discover(IpVersionFilter::Auto)
-                    .await
-                    .context("edge discovery")?;
-                let Some(first) = discovered.first() else {
-                    bail!("edge discovery returned no addresses");
-                };
-                let client = WarpClient::register()
-                    .await
-                    .context("registering with WARP")?;
-                let stack = client
-                    .connect()
-                    .await
-                    .context("opening the WARP MASQUE tunnel on 443")?;
-                let relay = crate::warp::edge::relay_over_warp(&stack, first.socket())
-                    .await
-                    .context("bridging the edge through WARP")?;
-                info!(
-                    edge = %first.socket(),
-                    relay = %relay.local,
-                    "the tunnel edge will be reached through WARP on 443"
-                );
-                let proxied = edge::EdgeAddr {
-                    ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                    port: relay.local.port(),
-                    version: edge::EdgeIpVersion::V4,
-                };
-                (vec![proxied], Some((stack, relay)))
+        // MASQUE tunnel on TCP 443, so this host never opens a socket to 7844.
+        //
+        // Auto is the default and answers the question the caller cannot: is
+        // 7844 reachable from here? It answers it by trying, not by probing: a
+        // TCP probe was measured to be the wrong signal, because a firewall can
+        // close TCP 7844 while leaving UDP 7844 — the QUIC path — wide open,
+        // and probing then reports the edge dead when it is not. So the direct
+        // attempt is bounded and real, and WARP is the fallback for when it
+        // fails or stalls.
+        let endpoint = quic_dial::build_endpoint()?;
+        let mut attempt = match transport {
+            Transport::Auto => Transport::Direct,
+            chosen => chosen,
+        };
+        let (edges, warp_keepalive, conn, control, location) = loop {
+            let outcome = match attempt {
+                Transport::Warp => match warp_targets(warp_identity.as_deref()).await {
+                    Ok((edges, keep)) => {
+                        connect_once(&endpoint, &auth, tunnel_id, 0, false, &edges)
+                            .await
+                            .map(|(conn, control, location)| {
+                                (edges, Some(keep), conn, control, location)
+                            })
+                    }
+                    Err(err) => Err(err),
+                },
+                _ => match direct_targets().await {
+                    Ok(edges) => {
+                        // A filtered port does not answer, so bound the attempt
+                        // rather than waiting for the transport's own timeout.
+                        match tokio::time::timeout(
+                            DIRECT_ATTEMPT_TIMEOUT,
+                            connect_once(&endpoint, &auth, tunnel_id, 0, false, &edges),
+                        )
+                        .await
+                        {
+                            Ok(result) => result.map(|(conn, control, location)| {
+                                (edges, None, conn, control, location)
+                            }),
+                            Err(_) => Err(anyhow::anyhow!(
+                                "the direct edge attempt did not complete in {}s",
+                                DIRECT_ATTEMPT_TIMEOUT.as_secs()
+                            )),
+                        }
+                    }
+                    Err(err) => Err(err),
+                },
+            };
+            match outcome {
+                Ok(ready) => break ready,
+                Err(err) if transport == Transport::Auto && attempt == Transport::Direct => {
+                    warn!(
+                        error = %err,
+                        "the edge is not reachable on 7844; falling back to WARP on TCP 443"
+                    );
+                    attempt = Transport::Warp;
+                }
+                Err(err) => return Err(err),
             }
         };
-        if edges.is_empty() {
-            bail!("edge discovery returned no addresses");
-        }
+        info!(transport = %attempt, %location, "registered with the edge");
         let edges = Arc::new(edges);
-
-        let endpoint = quic_dial::build_endpoint()?;
-        let (conn, control, location) =
-            connect_once(&endpoint, &auth, tunnel_id, 0, false, &edges).await?;
         metrics.connection_opened();
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -346,6 +372,85 @@ fn split_explicit(credentials: Credentials) -> Result<(rpc::TunnelAuth, Uuid)> {
     }
 }
 
+/// Edge addresses for a direct dial on port 7844.
+///
+/// `CFRS_EDGE` overrides discovery with a comma-separated `host:port` list, the
+/// way `cloudflared --edge` does. It exists for a self-hosted or pinned edge,
+/// and it is also the only way to test the `auto` fallback deliberately: point
+/// it at an address nothing answers on and direct must fail where discovery
+/// would have succeeded.
+async fn direct_targets() -> Result<Vec<edge::EdgeAddr>> {
+    if let Ok(list) = std::env::var("CFRS_EDGE") {
+        let mut overridden = Vec::new();
+        for item in list.split(',') {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            let socket: std::net::SocketAddr = item
+                .parse()
+                .with_context(|| format!("CFRS_EDGE entry {item:?} is not host:port"))?;
+            overridden.push(edge::EdgeAddr {
+                ip: socket.ip(),
+                port: socket.port(),
+                version: if socket.is_ipv4() {
+                    edge::EdgeIpVersion::V4
+                } else {
+                    edge::EdgeIpVersion::V6
+                },
+            });
+        }
+        if !overridden.is_empty() {
+            return Ok(overridden);
+        }
+    }
+    let discovered = edge::discover(IpVersionFilter::Auto)
+        .await
+        .context("edge discovery")?;
+    if discovered.is_empty() {
+        bail!("edge discovery returned no addresses");
+    }
+    Ok(discovered)
+}
+
+/// Edge addresses reached through a WARP MASQUE tunnel on TCP 443.
+async fn warp_targets(
+    identity: Option<&std::path::Path>,
+) -> Result<(Vec<edge::EdgeAddr>, (crate::warp::WarpStack, EdgeRelay))> {
+    let discovered = edge::discover(IpVersionFilter::Auto)
+        .await
+        .context("edge discovery")?;
+    let Some(first) = discovered.first() else {
+        bail!("edge discovery returned no addresses");
+    };
+    let client = match identity {
+        Some(path) => WarpClient::register_or_load(path)
+            .await
+            .context("registering with WARP")?,
+        None => WarpClient::register()
+            .await
+            .context("registering with WARP")?,
+    };
+    let stack = client
+        .connect()
+        .await
+        .context("opening the WARP MASQUE tunnel on TCP 443")?;
+    let relay = crate::warp::edge::relay_over_warp(&stack, first.socket())
+        .await
+        .context("bridging the edge through WARP")?;
+    info!(
+        edge = %first.socket(),
+        relay = %relay.local,
+        "carrying the edge connection through WARP on TCP 443"
+    );
+    let proxied = edge::EdgeAddr {
+        ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port: relay.local.port(),
+        version: edge::EdgeIpVersion::V4,
+    };
+    Ok((vec![proxied], (stack, relay)))
+}
+
 async fn connect_once(
     endpoint: &quinn::Endpoint,
     auth: &rpc::TunnelAuth,
@@ -426,7 +531,10 @@ async fn reactor(
         loop {
             attempt += 1;
             if attempt > policy.max_attempts {
-                warn!(conn_index, "giving up after {} reconnect attempts", policy.max_attempts);
+                warn!(
+                    conn_index,
+                    "giving up after {} reconnect attempts", policy.max_attempts
+                );
                 return;
             }
             let delay = policy.backoff(attempt);

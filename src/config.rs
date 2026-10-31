@@ -116,20 +116,35 @@ impl Protocol {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Transport {
     /// Dial the edge directly on port 7844. Fast, and what `cloudflared` does.
-    #[default]
     Direct,
     /// Carry the edge connection inside a WARP MASQUE tunnel on TCP 443, so the
     /// host never has to reach port 7844 at all.
     Warp,
+    /// Decide from the host: direct when the edge answers on 7844, WARP when it
+    /// does not. The default, so a quick tunnel works on an egress that permits
+    /// only 443 without the caller having to know which network it is on.
+    #[default]
+    Auto,
 }
 
 impl Transport {
     pub fn parse(value: &str) -> Result<Self> {
         match value.to_ascii_lowercase().as_str() {
+            "auto" => Ok(Transport::Auto),
             "direct" => Ok(Transport::Direct),
             "warp" | "masque" | "warp+masque" => Ok(Transport::Warp),
-            other => bail!("unknown transport {other:?}; expected direct or warp"),
+            other => bail!("unknown transport {other:?}; expected auto, direct or warp"),
         }
+    }
+}
+
+impl std::fmt::Display for Transport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Transport::Auto => "auto",
+            Transport::Direct => "direct",
+            Transport::Warp => "warp",
+        })
     }
 }
 
@@ -167,6 +182,10 @@ pub struct Config {
     pub credentials: Credentials,
     pub protocol: Protocol,
     pub transport: Transport,
+    /// Where to keep the WARP device and its MASQUE key so a later run resumes
+    /// it instead of registering a second device. `None` registers fresh each
+    /// time, which is what a one-shot caller wants.
+    pub warp_identity: Option<PathBuf>,
     pub ha_connections: u8,
     pub reconnect: ReconnectPolicy,
     pub ingress: Ingress,
@@ -180,7 +199,8 @@ impl Default for Config {
             user_agent: format!("cfrs/{}", env!("CARGO_PKG_VERSION")),
             credentials: Credentials::Quick,
             protocol: Protocol::Auto,
-            transport: Transport::Direct,
+            transport: Transport::default(),
+            warp_identity: None,
             ha_connections: 2,
             reconnect: ReconnectPolicy::default(),
             ingress: Ingress::default(),
@@ -239,4 +259,39 @@ pub fn load_file(path: &std::path::Path) -> Result<Config> {
         config.ha_connections = ha.clamp(1, 8);
     }
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_names_round_trip() {
+        for (text, want) in [
+            ("auto", Transport::Auto),
+            ("direct", Transport::Direct),
+            ("warp", Transport::Warp),
+            ("masque", Transport::Warp),
+            ("WARP+MASQUE", Transport::Warp),
+            ("  Direct ", Transport::Direct),
+        ] {
+            assert_eq!(Transport::parse(text.trim()).unwrap(), want, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_transport_names_the_alternatives() {
+        let err = Transport::parse("carrier-pigeon").unwrap_err().to_string();
+        assert!(err.contains("auto"), "{err}");
+        assert!(err.contains("direct"), "{err}");
+        assert!(err.contains("warp"), "{err}");
+    }
+
+    #[test]
+    fn the_default_transport_is_auto() {
+        // The point of the default is that a quick tunnel works on a host whose
+        // egress permits only 443 without the caller passing a flag.
+        assert_eq!(Transport::default(), Transport::Auto);
+        assert_eq!(Transport::default().to_string(), "auto");
+    }
 }

@@ -61,9 +61,14 @@ struct TunnelOpts {
     /// Edge transport: auto, quic or http2.
     #[arg(long, default_value = "auto", global = true)]
     protocol: String,
-    /// How to reach the edge: direct (port 7844) or warp (carried on TCP 443).
-    #[arg(long, default_value = "direct", global = true)]
+    /// How to reach the edge: auto (try 7844, fall back to WARP on 443),
+    /// direct (port 7844) or warp (carried on TCP 443).
+    #[arg(long, default_value = "auto", global = true)]
     transport: String,
+    /// Keep the WARP device and MASQUE key here and resume them next run.
+    /// Without it, every run registers a new anonymous device.
+    #[arg(long, value_name = "PATH", global = true)]
+    warp_identity: Option<PathBuf>,
     /// Do not fetch the public URL to prove reachability.
     #[arg(long, global = true)]
     no_verify: bool,
@@ -84,6 +89,7 @@ impl TunnelOpts {
         config.ha_connections = self.ha_connections.clamp(1, 8);
         config.protocol = Protocol::parse(&self.protocol)?;
         config.transport = Transport::parse(&self.transport)?;
+        config.warp_identity = self.warp_identity.clone();
         config.verify = !self.no_verify;
         Ok(config)
     }
@@ -678,6 +684,11 @@ struct NetArgs {
 
 #[derive(Args, Debug)]
 struct WarpArgs {
+    /// Keep the device and MASQUE key here and resume them next run, instead of
+    /// registering a new anonymous device every time.
+    #[arg(long, value_name = "PATH", global = true)]
+    identity: Option<PathBuf>,
+
     #[command(subcommand)]
     command: WarpCommand,
 }
@@ -697,9 +708,13 @@ enum WarpCommand {
 async fn warp(args: WarpArgs) -> Result<()> {
     use cfrs::warp::WarpClient;
 
+    let client = match args.identity.as_deref() {
+        Some(path) => WarpClient::register_or_load(path).await?,
+        None => WarpClient::register().await?,
+    };
+
     match args.command {
         WarpCommand::Register => {
-            let client = WarpClient::register().await?;
             let device = client.device();
             println!("device      {}", device.id);
             println!("account     {}", device.account.id);
@@ -719,7 +734,6 @@ async fn warp(args: WarpArgs) -> Result<()> {
             } else {
                 target
             };
-            let client = WarpClient::register().await?;
             println!("device      {}", client.device().id);
             println!("masque      {:?}", client.device().masque_endpoint());
             let stack = client.connect().await?;

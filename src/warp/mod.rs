@@ -68,10 +68,9 @@ impl WarpClient {
         if device.token.is_empty() {
             bail!("the registration response carried no token");
         }
-        let enrolled =
-            register::enrol_masque(&device.id, &device.token, identity.spki_b64())
-                .await
-                .context("enrolling the MASQUE identity")?;
+        let enrolled = register::enrol_masque(&device.id, &device.token, identity.spki_b64())
+            .await
+            .context("enrolling the MASQUE identity")?;
         if enrolled.tunnel_type != "masque" {
             bail!(
                 "the API kept tunnel_type {:?} instead of masque",
@@ -88,6 +87,82 @@ impl WarpClient {
     /// that persist them.
     pub fn from_parts(device: Device, identity: Identity) -> Self {
         Self { device, identity }
+    }
+
+    /// Write the device and the identity to one JSON file, so a later run can
+    /// resume the tunnel without registering a second device.
+    ///
+    /// The file holds the private key. It is written with mode 0600 and the
+    /// caller owns where it goes.
+    pub fn save(&self, path: &std::path::Path) -> Result<()> {
+        #[derive(serde::Serialize)]
+        struct Stored<'a> {
+            device: &'a Device,
+            cert_pem: String,
+            key_pem: String,
+        }
+        let (cert_pem, key_pem) = self.identity.to_pem()?;
+        let text = serde_json::to_string_pretty(&Stored {
+            device: &self.device,
+            cert_pem,
+            key_pem,
+        })
+        .context("serialising the WARP identity")?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(path, text)
+            .with_context(|| format!("writing the WARP identity to {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).ok();
+        }
+        Ok(())
+    }
+
+    /// Read a client written by [`WarpClient::save`].
+    pub fn load(path: &std::path::Path) -> Result<Self> {
+        #[derive(serde::Deserialize)]
+        struct Stored {
+            device: Device,
+            cert_pem: String,
+            key_pem: String,
+        }
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading the WARP identity from {}", path.display()))?;
+        let stored: Stored = serde_json::from_str(&text)
+            .with_context(|| format!("parsing the WARP identity in {}", path.display()))?;
+        let identity = Identity::from_pem(&stored.cert_pem, &stored.key_pem)
+            .context("rebuilding the MASQUE identity")?;
+        Ok(Self {
+            device: stored.device,
+            identity,
+        })
+    }
+
+    /// Register if `path` holds nothing yet, otherwise resume what it holds.
+    ///
+    /// This is the call a daemon wants: one device per installation, not one
+    /// per start.
+    pub async fn register_or_load(path: &std::path::Path) -> Result<Self> {
+        match Self::load(path) {
+            Ok(client) => {
+                if client.device.tunnel_type == "masque" {
+                    return Ok(client);
+                }
+                tracing::debug!(
+                    tunnel_type = %client.device.tunnel_type,
+                    "the stored device is not enrolled for MASQUE; registering again"
+                );
+            }
+            Err(err) => {
+                tracing::debug!(%err, "no stored WARP identity; registering a new device");
+            }
+        }
+        let client = Self::register().await?;
+        client.save(path)?;
+        Ok(client)
     }
 
     /// The device record, including the assigned addresses and the pinned peer

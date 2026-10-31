@@ -18,7 +18,7 @@ adds a full service layer on top:
 | `cfrs qr` | Render a URL as a terminal QR code. |
 | `cfrs demo` | Self-contained proof: a built-in origin, a quick tunnel, then a fetch of the public URL. |
 | `cfrs net` | Userspace virtual networking: an `LD_PRELOAD` socket shim and a `smoltcp` stack, so a host with no `AF_INET` still has addresses. |
-| `cfrs warp` | Anonymous Cloudflare WARP registration and a MASQUE tunnel, so the edge is reachable on TCP 443 alone. |
+| `cfrs warp` | Anonymous Cloudflare WARP registration and a MASQUE tunnel, so the edge is reachable on TCP 443 alone. `--transport auto` (default) uses it when 7844 does not answer. |
 
 The whole thing is also a library; see [Library](#library).
 
@@ -173,8 +173,9 @@ cfrs tunnel --url http://127.0.0.1:3000 --forward tcp://127.0.0.1:5432
 - **QUIC over UDP/7844.** Where outbound TCP/7844 is blocked, the UDP path still
   works, and the edge is discovered by DNS SRV + DNS-over-TLS rather than a
   hard-coded address.
-- **TCP 443 as the only way out.** Where 7844 is filtered outright, `--transport
-  warp` carries the edge connection inside a MASQUE tunnel on 443. See
+- **TCP 443 as the only way out.** Where 7844 is filtered outright,
+  `--transport warp` carries the edge connection inside a MASQUE tunnel on 443.
+  `--transport auto` is the default and picks between the two by trying. See
   *Reaching the edge through WARP* below.
 - **No `cloudflared`.** The protocol is implemented in-process, so the host needs
   no Go binary and no extra privileges.
@@ -198,7 +199,8 @@ Some limits are kernel policy, not missing code. Measured on the host where
 - The edge's HTTP/2 transport is on TCP **7844**, which is `EACCES` here, and
   the tunnel service is not served on 443 (that port answers with a legacy 2020
   certificate). So `--protocol http2` is implemented for normal hosts but is
-  unusable from this sandbox; QUIC over UDP 7844 is.
+  unusable from this sandbox. QUIC over **UDP** 7844 answers, which is why the
+  direct transport works here and `auto` selects it.
 - `bind(2)` on `AF_INET` fails with `EACCES`; `AF_UNIX` works. That is why
   `--unix` exists and why `cfrs connect` can use `unix://` locally here.
 
@@ -263,13 +265,57 @@ Nothing external is involved: no `warp-cli`, no `wgcf`, no `cloudflared`. The
 registration is two HTTP calls, the session is one HTTP/2 `CONNECT`, and the
 `smoltcp` stack above it (`cfrs::warp`) carries the packets.
 
-Measured on a host with open egress, so it proves the implementation rather than
-the sandbox: `cfrs tunnel --hello-world --transport warp` provisions a quick
-tunnel, registers with the edge through the MASQUE session, and fetches its own
-public URL for HTTP 200, while `cfrs warp probe` reaches `1.1.1.1:443` and
-`198.41.192.27:7844` in about 100 ms each. The library form is
-`WarpClient::register()` followed by `connect()`, which returns a stack whose
-`tcp_connect` reaches what the host itself cannot.
+### What was measured, and what it does and does not prove
+
+`cfrs tunnel --hello-world --transport warp` provisions a quick tunnel,
+registers with the edge through the MASQUE session, prints the public URL and
+then fetches it for **HTTP 200**. A real packet round trip was checked
+separately: `examples/warp_prove.rs` sends a hand-built DNS query through the
+tunnel to `1.1.1.1:53` and parses the answer back (`example.com` →
+`104.20.23.154`), and opens a TCP connection to the edge on **7844** from
+inside the tunnel. Two negative controls run first in the same example — a
+closed port and an unroutable address must both fail — so a stack that simply
+reports success cannot pass it.
+
+One honest limit. The development host turns out to permit **UDP** 7844 while
+refusing **TCP** 7844, so the direct transport works there too and WARP is not
+strictly *necessary* on it. Necessity is therefore shown by making direct
+impossible rather than by observing the firewall: `CFRS_EDGE=127.0.0.1:9`
+pins edge discovery to an address nothing answers on, and the tunnel still comes
+up and serves HTTP 200 — through WARP. `tools/prove-warp.sh` runs all four
+steps and exits non-zero if any of them does not hold.
+
+`--transport auto` (the default) tries direct first, bounded at 8 seconds, and
+falls back to WARP. It does **not** probe port 7844 with TCP first: that probe
+was measured to be the wrong signal, because a firewall can close TCP 7844 while
+leaving the QUIC path on UDP 7844 open — as this host does — and the probe then
+reports the edge dead when it is not.
+
+### The library form
+
+```rust,no_run
+# async fn run() -> anyhow::Result<()> {
+use cfrs::warp::WarpClient;
+
+// Anonymous: no account, no token, no external tool.
+let client = WarpClient::register().await?;
+let stack = client.connect().await?;          // MASQUE CONNECT-IP on TCP 443
+let conn = stack.tcp_connect("198.41.192.27:7844".parse()?).await?;
+# let _ = conn;
+# Ok(())
+# }
+```
+
+`WarpClient::save` / `WarpClient::load` persist the device and its P-256 key
+(file mode 0600), and `WarpClient::register_or_load` is the one call a daemon
+wants: one device per installation, not one per start. `--warp-identity <path>`
+does the same for the CLI.
+
+The MASQUE client certificate is a self-signed P-256 certificate over the key
+enrolled with `PATCH /reg/{id}`; the front door's certificate is pinned to the
+SPKI the API returned in `peers[0].public_key`, which was verified byte-identical
+to the key the endpoint actually serves. The chain is Cloudflare-internal, so
+ordinary public-CA validation cannot apply.
 
 ## How it works
 

@@ -32,8 +32,8 @@ impl Identity {
     pub fn generate() -> Result<Self> {
         use base64::Engine;
 
-        let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
-            .context("generating a P-256 keypair")?;
+        let key_pair =
+            KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).context("generating a P-256 keypair")?;
 
         let params = CertificateParams::new(Vec::<String>::new())
             .context("building certificate parameters")?;
@@ -79,6 +79,53 @@ impl Identity {
     pub fn key_pair(&self) -> &KeyPair {
         &self.key_pair
     }
+
+    /// The certificate and private key as PEM, so a caller can persist the
+    /// identity and resume it instead of registering a second device.
+    ///
+    /// The private key is the credential: whoever holds it can open the tunnel
+    /// for this device. Store it the way any other private key is stored.
+    pub fn to_pem(&self) -> Result<(String, String)> {
+        let cert_pem = pem_encode("CERTIFICATE", self.cert_der.as_ref());
+        let key_pem = self.key_pair.serialize_pem();
+        Ok((cert_pem, key_pem))
+    }
+
+    /// Rebuild an identity from [`Identity::to_pem`] output.
+    pub fn from_pem(cert_pem: &str, key_pem: &str) -> Result<Self> {
+        let key_pair = KeyPair::from_pem(key_pem).context("parsing the MASQUE private key")?;
+        let mut reader = std::io::BufReader::new(cert_pem.as_bytes());
+        let cert_der = rustls_pemfile::certs(&mut reader)
+            .next()
+            .context("the certificate PEM is empty")?
+            .context("parsing the certificate PEM")?;
+        let spki_der = key_pair.subject_public_key_info();
+        let spki_b64 = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(&spki_der)
+        };
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+        Ok(Self {
+            key_pair,
+            cert_der,
+            key_der,
+            spki_b64,
+            spki_der,
+        })
+    }
+}
+
+/// Wrap DER in PEM armour at 64 columns, which is what every reader expects.
+fn pem_encode(label: &str, der: &[u8]) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut out = format!("-----BEGIN {label}-----\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(chunk).unwrap_or_default());
+        out.push('\n');
+    }
+    out.push_str(&format!("-----END {label}-----\n"));
+    out
 }
 
 /// Extract the SubjectPublicKeyInfo DER from a PEM `PUBLIC KEY` block.
@@ -125,6 +172,28 @@ mod tests {
         let id = Identity::generate().unwrap();
         let from_cert = spki_from_cert(id.cert_chain()[0].as_ref()).unwrap();
         assert_eq!(from_cert, id.spki_der());
+    }
+
+    #[test]
+    fn the_identity_survives_a_pem_round_trip() {
+        let id = Identity::generate().unwrap();
+        let (cert_pem, key_pem) = id.to_pem().unwrap();
+        assert!(cert_pem.starts_with("-----BEGIN CERTIFICATE-----"));
+        assert!(key_pem.contains("PRIVATE KEY"));
+
+        let back = Identity::from_pem(&cert_pem, &key_pem).unwrap();
+        assert_eq!(back.spki_der(), id.spki_der());
+        assert_eq!(back.spki_b64(), id.spki_b64());
+        // The rebuilt certificate is the same one, so the TLS identity is too.
+        assert_eq!(back.cert_chain()[0].as_ref(), id.cert_chain()[0].as_ref());
+    }
+
+    #[test]
+    fn a_truncated_certificate_pem_is_an_error_not_a_panic() {
+        let id = Identity::generate().unwrap();
+        let (cert_pem, key_pem) = id.to_pem().unwrap();
+        let _ = cert_pem;
+        assert!(Identity::from_pem("-----BEGIN CERTIFICATE-----\n", &key_pem).is_err());
     }
 
     #[test]

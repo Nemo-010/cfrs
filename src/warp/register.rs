@@ -42,7 +42,11 @@ pub const MASQUE_PORT: u16 = 443;
 pub const CONNECT_URI: &str = "https://cloudflareaccess.com";
 
 /// The device as the API reports it.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// `Serialize` is not for the wire (the API only takes the two bodies below);
+/// it exists so a caller can persist a registered device and resume it without
+/// registering a second one.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Device {
     pub id: String,
     #[serde(default)]
@@ -66,7 +70,7 @@ pub struct Device {
     pub policy: Policy,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Account {
     pub id: String,
     #[serde(default)]
@@ -75,7 +79,7 @@ pub struct Account {
     pub license: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DeviceConfig {
     #[serde(default)]
     pub client_id: String,
@@ -87,7 +91,7 @@ pub struct DeviceConfig {
     pub services: Services,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Peer {
     #[serde(default)]
     pub public_key: String,
@@ -95,7 +99,7 @@ pub struct Peer {
     pub endpoint: Endpoint,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Endpoint {
     #[serde(default)]
     pub v4: String,
@@ -107,13 +111,13 @@ pub struct Endpoint {
     pub ports: Vec<u16>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Interface {
     #[serde(default)]
     pub addresses: Addresses,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Addresses {
     #[serde(default)]
     pub v4: String,
@@ -121,13 +125,13 @@ pub struct Addresses {
     pub v6: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Services {
     #[serde(default)]
     pub http_proxy: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Policy {
     #[serde(default)]
     pub tunnel_protocol: String,
